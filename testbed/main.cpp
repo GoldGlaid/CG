@@ -830,8 +830,8 @@ void shutdown() {
 	vkDestroySampler(device, missing_texture_sampler, nullptr);
 	delete missing_texture;
 
-	delete cube_mesh.index_buffer;
-	delete cube_mesh.vertex_buffer;
+	delete plane_mesh.vertex_buffer;
+	delete plane_mesh.index_buffer;
 
 	delete cube_mesh.index_buffer;
 	delete cube_mesh.vertex_buffer;
