@@ -4,6 +4,7 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
+#include <cstring>
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -16,18 +17,34 @@
 #include <lodepng.h>
 
 namespace {
+// ОСНОВНЫЕ ЗАДАНИЯ:
+// 1. Генерация тора (200 вершин) - generateTorusMesh()
+// 2. Анимация цвета через sin(time) - shaders/shader.frag
+// 3. Вращение тора вокруг оси
+// 4. UI элементы - update()
+// 5. Инициализация тора - initialize()
+//
+// ДОПОЛНИТЕЛЬНЫЕ ЗАДАНИЯ:
+// 1. Переключение проекции (перспективная/ортографическая):
+//    - Camera::orthographic()
+//    - Camera::view_projection()
+// 2. Управление анимацией (пауза и реверс):
+//    - update()
+
 
 constexpr uint32_t max_models = 1024;
 
 struct Vertex {
-	veekay::vec3 position;
+	veekay::vec3 position; // Позиция точки на объекте
 	veekay::vec3 normal;
-	veekay::vec2 uv;
+	veekay::vec2 uv; // текстура
 	// NOTE: You can add more attributes
 };
 
 struct SceneUniforms {
 	veekay::mat4 view_projection;
+	float time;  // Для анимации цвета через sin(time)
+	float _pad0, _pad1, _pad2;  // Выравнивание для std140
 };
 
 struct ModelUniforms {
@@ -68,8 +85,14 @@ struct Camera {
 	float near_plane = default_near_plane;
 	float far_plane = default_far_plane;
 
+	bool is_perspective = true;  // Доп. задание 1: флаг типа проекции
+	float ortho_size = 10.0f;     // Доп. задание 1: размер видимой области ортографической проекции
+
 	// NOTE: View matrix of camera (inverse of a transform)
 	veekay::mat4 view() const;
+
+	// NOTE: Orthographic projection matrix
+	veekay::mat4 orthographic(float aspect_ratio) const;
 
 	// NOTE: View and projection composition
 	veekay::mat4 view_projection(float aspect_ratio) const;
@@ -78,10 +101,17 @@ struct Camera {
 // NOTE: Scene objects
 inline namespace {
 	Camera camera{
-		.position = {0.0f, -0.5f, -3.0f}
+		.position = {0.0f, -1.0f, -10.0f}
 	};
 
 	std::vector<Model> models;
+
+	// ДОПОЛНИТЕЛЬНЫЕ ЗАДАНИЯ
+	// UI variables for additional features
+	bool is_animation_paused = false;
+	bool is_rotation_reversed = false;
+	float rotation_speed = 1.0f;      // UI: скорость вращения
+	float animation_time = 0.0f;       // Накопленное время анимации
 }
 
 // NOTE: Vulkan objects
@@ -102,23 +132,120 @@ inline namespace {
 	Mesh plane_mesh;
 	Mesh cube_mesh;
 
+	// Настройка цвета кубика в прямом эфире
+	veekay::vec3 cube_color = {0.0f, 1.0f, 0.735f};
+
 	veekay::graphics::Texture* missing_texture;
 	VkSampler missing_texture_sampler;
 
 	veekay::graphics::Texture* texture;
 	VkSampler texture_sampler;
+
+	// Выравнивание размеров для устранения ошибки Vulkan
+	uint32_t min_uniform_buffer_offset_alignment;
+	uint32_t aligned_model_uniforms_size;
+
+	Mesh torus_mesh;  // Тор
 }
 
 float toRadians(float degrees) {
 	return degrees * float(M_PI) / 180.0f;
 }
 
+// Тор (200 вершин)
+Mesh generateTorusMesh(float majorRadius, float minorRadius, 
+                       uint32_t majorSegments, uint32_t minorSegments) {
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
+	
+	// Двойной цикл для генерации вершин
+	for (uint32_t i = 0; i <= majorSegments; ++i) {
+		float u = float(i) / float(majorSegments) * 2.0f * float(M_PI);
+		float cos_u = cosf(u);
+		float sin_u = sinf(u);
+		
+		for (uint32_t j = 0; j <= minorSegments; ++j) {
+			float v = float(j) / float(minorSegments) * 2.0f * float(M_PI);
+			float cos_v = cosf(v);
+			float sin_v = sinf(v);
+			
+			// Параметрические уравнения тора
+			// x = (R + r*cos(v))*cos(u)
+			// y = (R + r*cos(v))*sin(u)
+			// z = r*sin(v)
+			float x = (majorRadius + minorRadius * cos_v) * cos_u;
+			float y = (majorRadius + minorRadius * cos_v) * sin_u;
+			float z = minorRadius * sin_v;
+			
+			veekay::vec3 position{x, y, z};
+			
+			// Нормаль: вектор от центра тора к поверхности (нормализованный)
+			veekay::vec3 center_to_surface{cos_u * cos_v, sin_u * cos_v, sin_v};
+
+			// Нормализуем вектор нормали
+			float len = sqrtf(center_to_surface.x * center_to_surface.x + 
+			                  center_to_surface.y * center_to_surface.y + 
+			                  center_to_surface.z * center_to_surface.z);
+			veekay::vec3 normal{center_to_surface.x / len, 
+			                   center_to_surface.y / len, 
+			                   center_to_surface.z / len};
+			
+			// UV координаты
+			veekay::vec2 uv{float(i) / float(majorSegments), 
+			                float(j) / float(minorSegments)};
+			
+			vertices.push_back(Vertex{position, normal, uv});
+		}
+	}
+	
+	// Генерация индексов для треугольников
+	for (uint32_t i = 0; i < majorSegments; ++i) {
+		for (uint32_t j = 0; j < minorSegments; ++j) {
+			uint32_t current = i * (minorSegments + 1) + j;
+			uint32_t next = current + minorSegments + 1;
+			
+			// Первый треугольник
+			indices.push_back(current);
+			indices.push_back(next);
+			indices.push_back(current + 1);
+			
+			// Второй треугольник
+			indices.push_back(current + 1);
+			indices.push_back(next);
+			indices.push_back(next + 1);
+		}
+	}
+	
+	Mesh mesh;
+	mesh.vertex_buffer = new veekay::graphics::Buffer(
+		vertices.size() * sizeof(Vertex), vertices.data(),
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+	
+	mesh.index_buffer = new veekay::graphics::Buffer(
+		indices.size() * sizeof(uint32_t), indices.data(),
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+	
+	mesh.indices = uint32_t(indices.size());
+	
+	return mesh;
+}
+
 veekay::mat4 Transform::matrix() const {
-	// TODO: Scaling and rotation
-
+	// Пполная матрица преобразования (scaling + rotation + translation)
+	
+	auto s = veekay::mat4::scaling(scale);
+	
+	// Вращение вокруг осей X, Y, Z (в радианах)
+	auto rx = veekay::mat4::rotation(veekay::vec3{1.0f, 0.0f, 0.0f}, rotation.x);
+	auto ry = veekay::mat4::rotation(veekay::vec3{0.0f, 1.0f, 0.0f}, rotation.y);
+	auto rz = veekay::mat4::rotation(veekay::vec3{0.0f, 0.0f, 1.0f}, rotation.z);
+	
+	auto r = rz * ry * rx;  // Порядок: сначала X, потом Y, потом Z
+	
 	auto t = veekay::mat4::translation(position);
-
-	return t;
+	
+	// Порядок применения: Scale -> Rotate -> Translate
+	return t * r * s;
 }
 
 veekay::mat4 Camera::view() const {
@@ -129,10 +256,66 @@ veekay::mat4 Camera::view() const {
 	return t;
 }
 
-veekay::mat4 Camera::view_projection(float aspect_ratio) const {
-	auto projection = veekay::mat4::projection(fov, aspect_ratio, near_plane, far_plane);
+// доп. задание 1: Ортографическая проекция
 
-	return view() * projection;
+// Ортографическая проекция работает следующим образом:
+// - В отличие от перспективной проекции, ортографическая проецирует объекты параллельными лучами
+// - Объекты не становятся меньше с расстоянием (нет перспективного искажения)
+// - Параметры left, right, bottom, top определяют видимую область (видимый объем)
+// - near и far определяют диапазон глубины
+// - Матрица ортографической проекции преобразует координаты из видимого объема в NDC (Normalized Device Coordinates) [-1, 1]
+
+veekay::mat4 Camera::orthographic(float aspect_ratio) const {
+	veekay::mat4 result{};
+	
+	// Вычисляем размеры для ортографической проекции
+	// Используем настраиваемый размер видимой области из camera.ortho_size
+	float height = ortho_size;  // Размер видимой области (половина высоты)
+	float width = height * aspect_ratio;  // Ширина пропорциональна высоте и aspect ratio
+	
+	// Ортографическая матрица проекции
+	// Определяем границы видимого объема (фрустума)
+	float l = -width;   // left
+	float r = width;     // right
+	float b = -height;   // bottom
+	float t = height;    // top
+	float n = near_plane; // near
+	float f = far_plane;  // far
+	
+	// Ортографическая матрица проекции (для Vulkan с Z в [0, 1]):
+	// Перспективная проекция использует: result[2][2] = far/(far-near), result[3][2] = (-near*far)/(far-near)
+	// Это формула для Vulkan с Z в диапазоне [0, 1] в NDC
+	
+	result[0][0] = 2.0f / (r - l);
+	result[0][1] = 0.0f;
+	result[0][2] = 0.0f;
+	result[0][3] = 0.0f;
+	
+	result[1][0] = 0.0f;
+	result[1][1] = 2.0f / (t - b);
+	result[1][2] = 0.0f;
+	result[1][3] = 0.0f;
+
+	result[2][0] = 0.0f;
+	result[2][1] = 0.0f;
+	result[2][2] = 1.0f / (f - n);  // Для Z в [0, 1], как в перспективной проекции
+	result[2][3] = 0.0f;
+	
+	result[3][0] = -(r + l) / (r - l);   // Смещение по X для центрирования
+	result[3][1] = -(t + b) / (t - b);   // Смещение по Y для центрирования
+	result[3][2] = -n / (f - n);         // Смещение по Z для Vulkan
+	result[3][3] = 1.0f;
+	
+	return result;
+}
+
+veekay::mat4 Camera::view_projection(float aspect_ratio) const {
+	// Доп. задание 1: Выбор типа проекции
+	veekay::mat4 proj = is_perspective 
+		? veekay::mat4::projection(fov, aspect_ratio, near_plane, far_plane)
+		: orthographic(aspect_ratio);
+
+	return view() * proj;
 }
 
 // NOTE: Loads shader byte code from file
@@ -161,8 +344,8 @@ VkShaderModule loadShaderModule(const char* path) {
 }
 
 void initialize(VkCommandBuffer cmd) {
-	VkDevice& device = veekay::app.vk_device;
-	VkPhysicalDevice& physical_device = veekay::app.vk_physical_device;
+	VkDevice& device = veekay::app.vk_device; // Интерфейс для общения с видеокартой
+	VkPhysicalDevice& physical_device = veekay::app.vk_physical_device; //физические параметры видюхи
 
 	{ // NOTE: Build graphics pipeline
 		vertex_shader_module = loadShaderModule("./shaders/shader.vert.spv");
@@ -201,7 +384,7 @@ void initialize(VkCommandBuffer cmd) {
 		VkVertexInputBindingDescription buffer_binding{
 			.binding = 0,
 			.stride = sizeof(Vertex),
-			.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+			.inputRate = VK_VERTEX_INPUT_RATE_VERTEX, // Частота подключения к буферу
 		};
 
 		// NOTE: Declare vertex attributes
@@ -271,6 +454,7 @@ void initialize(VkCommandBuffer cmd) {
 		};
 
 		VkRect2D scissor{
+			// Обрезка окна
 			.offset = {0, 0},
 			.extent = {veekay::app.window_width, veekay::app.window_height},
 		};
@@ -429,13 +613,27 @@ void initialize(VkCommandBuffer cmd) {
 		}
 	}
 
+	// Исправление ошибки Vulkan о выравнивании
+	// ==============================================================
+	// NOTE: Get device alignment requirements
+	VkPhysicalDeviceProperties physical_device_properties;
+	vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
+	min_uniform_buffer_offset_alignment = static_cast<uint32_t>(
+		physical_device_properties.limits.minUniformBufferOffsetAlignment);
+
+	// NOTE: Calculate aligned size for ModelUniforms
+	uint32_t model_uniforms_size = sizeof(ModelUniforms);
+	aligned_model_uniforms_size = (model_uniforms_size + min_uniform_buffer_offset_alignment - 1) 
+		& ~(min_uniform_buffer_offset_alignment - 1);
+	// ==============================================================
+
 	scene_uniforms_buffer = new veekay::graphics::Buffer(
 		sizeof(SceneUniforms),
 		nullptr,
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
 	model_uniforms_buffer = new veekay::graphics::Buffer(
-		max_models * sizeof(ModelUniforms),
+		max_models * aligned_model_uniforms_size,
 		nullptr,
 		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
@@ -472,7 +670,7 @@ void initialize(VkCommandBuffer cmd) {
 			{
 				.buffer = model_uniforms_buffer->buffer,
 				.offset = 0,
-				.range = sizeof(ModelUniforms),
+				.range = aligned_model_uniforms_size,
 			},
 		};
 
@@ -584,35 +782,44 @@ void initialize(VkCommandBuffer cmd) {
 		cube_mesh.indices = uint32_t(indices.size());
 	}
 
+	// Инициализация тора
+	// Генерируем тор с ~200 вершинами
+	// majorSegments * minorSegments должно дать примерно 200 вершин
+	// Например: 12 * 16 = 192 вершины (13 * 17 = 221 вершина)
+	torus_mesh = generateTorusMesh(1.5f, 0.5f, 12, 16);
+
 	// NOTE: Add models to scene
+
+	models.clear();
+
+	// Тор
 	models.emplace_back(Model{
-		.mesh = plane_mesh,
-		.transform = Transform{},
-		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f}
+		.mesh = torus_mesh,
+		.transform = Transform{
+			.position = {0.0f, -2.0f, 0.0f},
+			.scale = {1.0f, 1.0f, 1.0f},
+			.rotation = {0.0f, 0.0f, 0.0f},
+		},
+		.albedo_color = veekay::vec3{2.0f, 2.0f, 2.0f}  // Специальное значение для тора (будет анимироваться в шейдере)
 	});
 
+	// Белая плоскость (Сетка куба)
 	models.emplace_back(Model{
 		.mesh = cube_mesh,
 		.transform = Transform{
-			.position = {-2.0f, -0.5f, -1.5f},
+			.position = {0.0f, 1.0f, 0.0f},
+			.scale = {-15.0f, 1.0f, 15.0f},
 		},
-		.albedo_color = veekay::vec3{1.0f, 0.0f, 0.0f}
+		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f}  // Белая плоскость (не будет анимироваться)
 	});
 
+	// Куб
 	models.emplace_back(Model{
 		.mesh = cube_mesh,
 		.transform = Transform{
-			.position = {1.5f, -0.5f, -0.5f},
+			.position = {0.0f, -2.0f, 0.0f},
 		},
-		.albedo_color = veekay::vec3{0.0f, 1.0f, 0.0f}
-	});
-
-	models.emplace_back(Model{
-		.mesh = cube_mesh,
-		.transform = Transform{
-			.position = {0.0f, -0.5f, 1.0f},
-		},
-		.albedo_color = veekay::vec3{0.0f, 0.0f, 1.0f}
+		.albedo_color = cube_color
 	});
 }
 
@@ -626,8 +833,11 @@ void shutdown() {
 	delete cube_mesh.index_buffer;
 	delete cube_mesh.vertex_buffer;
 
-	delete plane_mesh.index_buffer;
-	delete plane_mesh.vertex_buffer;
+	delete cube_mesh.index_buffer;
+	delete cube_mesh.vertex_buffer;
+
+	delete torus_mesh.index_buffer;
+	delete torus_mesh.vertex_buffer;
 
 	delete model_uniforms_buffer;
 	delete scene_uniforms_buffer;
@@ -642,8 +852,63 @@ void shutdown() {
 }
 
 void update(double time) {
+
 	ImGui::Begin("Controls:");
+	ImGui::ColorEdit3("Cube Color", &cube_color.x);
+	
+	// Slider для FOV камеры
+	if (camera.is_perspective) {
+		if (ImGui::SliderFloat("FOV", &camera.fov, 30.0f, 120.0f)) {
+		}
+	}
+	
+	// Slider для скорости вращения
+	if (ImGui::SliderFloat("Rotation Speed", &rotation_speed, 0.0f, 100.0f)) {
+	}
+	
+	// ДОП. ЗАДАНИЕ 1: Переключение проекции
+	if (ImGui::Checkbox("Perspective Projection", &camera.is_perspective)) {
+	}
+
+	ImGui::SameLine();
+	if (!camera.is_perspective) {
+		ImGui::Text("(Orthographic)");
+	}
+
+	// UI для настройки размера ортографической проекции
+	if (!camera.is_perspective) {
+		if (ImGui::SliderFloat("Orthographic Size", &camera.ortho_size, 1.0f, 50.0f)) {
+			// Размер видимой области ортографической проекции обновляется напрямую
+
+		}
+		// Доп инфа
+		ImGui::Text("Visible area: %.1f x %.1f (X x Y)", 
+		           camera.ortho_size * 2.0f, 
+		           camera.ortho_size * 2.0f);
+	}
+	
+	// ДОП. ЗАДАНИЕ 2: Управление анимацией
+	if (ImGui::Checkbox("Pause Animation", &is_animation_paused)) {
+		// Пауза/возобновление анимации
+	}
+	
+	if (ImGui::Checkbox("Reverse Rotation", &is_rotation_reversed)) {
+		// Реверс направления вращения
+	}
+	
 	ImGui::End();
+
+	// ДОП. ЗАДАНИЕ 2: Анимация вращения
+	// Обновляем накопленное время анимации (если не на паузе)
+	if (!is_animation_paused) {
+		animation_time = time * rotation_speed * (is_rotation_reversed ? -1.0f : 1.0f);
+	}
+	// Если на паузе, animation_time не меняется (сохраняется последнее значение)
+
+	// Обновляем вращение тора вокруг своей оси (Y-axis)
+	if (!models.empty()) {
+		models[0].transform.rotation.y = animation_time;
+	}
 
 	if (!ImGui::IsWindowHovered()) {
 		using namespace veekay::input;
@@ -681,8 +946,11 @@ void update(double time) {
 	}
 
 	float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
+	
+	// Добавить время в uniform
 	SceneUniforms scene_uniforms{
 		.view_projection = camera.view_projection(aspect_ratio),
+		.time = static_cast<float>(time),  // Передаем время для анимации цвета
 	};
 
 	std::vector<ModelUniforms> model_uniforms(models.size());
@@ -691,13 +959,22 @@ void update(double time) {
 		ModelUniforms& uniforms = model_uniforms[i];
 
 		uniforms.model = model.transform.matrix();
-		uniforms.albedo_color = model.albedo_color;
+		// Обновляем цвет куба из переменной cube_color (которая изменяется через UI)
+		if (i == 2) { // Индекс 2 - это куб (тор=0, плоскость=1, куб=2)
+			uniforms.albedo_color = cube_color;
+		} else {
+			uniforms.albedo_color = model.albedo_color;
+		}
 	}
 
+	// Исправление ошибки Vulkan о выравнивании
 	*(SceneUniforms*)scene_uniforms_buffer->mapped_region = scene_uniforms;
-	std::copy(model_uniforms.begin(),
-	          model_uniforms.end(),
-	          static_cast<ModelUniforms*>(model_uniforms_buffer->mapped_region));
+	// NOTE: Copy model uniforms with proper alignment
+	uint8_t* buffer_ptr = static_cast<uint8_t*>(model_uniforms_buffer->mapped_region);
+	for (size_t i = 0; i < model_uniforms.size(); ++i) {
+		std::memcpy(buffer_ptr + i * aligned_model_uniforms_size, 
+		           &model_uniforms[i], sizeof(ModelUniforms));
+	}
 }
 
 void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
@@ -755,7 +1032,9 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 			vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
 		}
 
-		uint32_t offset = i * sizeof(ModelUniforms);
+		// Исправление ошибки Vulkan о выравнивании
+		uint32_t offset = i * aligned_model_uniforms_size;
+
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
 		                    0, 1, &descriptor_set, 1, &offset);
 
