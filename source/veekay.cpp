@@ -19,9 +19,9 @@
 
 namespace {
 
-constexpr uint32_t window_default_width = 1280;
-constexpr uint32_t window_default_height = 720;
-constexpr char window_title[] = "Veekay";
+constexpr uint32_t window_default_width = 2024;
+constexpr uint32_t window_default_height = 1280;
+constexpr char window_title[] = "Пасхалка";
 
 constexpr uint32_t max_frames_in_flight = 2;
 

@@ -283,8 +283,7 @@ veekay::mat4 Camera::orthographic(float aspect_ratio) const {
 	float f = far_plane;  // far
 	
 	// Ортографическая матрица проекции (для Vulkan с Z в [0, 1]):
-	// Перспективная проекция использует: result[2][2] = far/(far-near), result[3][2] = (-near*far)/(far-near)
-	// Это формула для Vulkan с Z в диапазоне [0, 1] в NDC
+	// Перспективная проекция использует: result[2][2] = far / (far-near), result[3][2] = (-near*far) / (far-near)
 	
 	result[0][0] = 2.0f / (r - l);
 	result[0][1] = 0.0f;
@@ -783,9 +782,9 @@ void initialize(VkCommandBuffer cmd) {
 	}
 
 	// Инициализация тора
-	// Генерируем тор с ~200 вершинами
-	// majorSegments * minorSegments должно дать примерно 200 вершин
-	// Например: 12 * 16 = 192 вершины (13 * 17 = 221 вершина)
+	// Тор с ~200 вершинами
+	// majorSegments * minorSegments ~ 200 вершин
+	// 12 * 16 = 192 вершины (13 * 17 = 221)
 	torus_mesh = generateTorusMesh(1.5f, 0.5f, 12, 16);
 
 	// NOTE: Add models to scene
