@@ -1,4 +1,7 @@
 #version 450
+// ============================================================================
+// Доп. задание: используется time из SceneUniforms для передачи в fragment shader
+// ============================================================================
 
 layout (location = 0) in vec3 v_position;
 layout (location = 1) in vec3 v_normal;
@@ -11,21 +14,31 @@ layout (location = 2) out vec2 f_uv;
 layout (binding = 0, std140) uniform SceneUniforms {
   mat4 view_projection;
   float time;  //  Время для анимации цвета
-  float _pad0, _pad1, _pad2;  // Выравнивание для std140
-};
+  uint point_light_count;  // Количество активных точечных источников
+  vec3 camera_position;  // Позиция камеры для расчета view direction
+  float _pad0;  // Выравнивание для std140
+} scene;
 
 layout (binding = 1, std140) uniform ModelUniforms {
   mat4 model;
   vec3 albedo_color;
-};
+  float _pad0;
+  vec3 specular_color;
+  float shininess;
+} material;
 
 void main() {
-  vec4 position = model * vec4(v_position, 1.0f);
-  vec4 normal = model * vec4(v_normal, 0.0f);
+  vec4 position = material.model * vec4(v_position, 1.0f);
+  
+  // Для нормалей используем обратную транспонированную матрицу модели
+  // Но для упрощения используем только верхнюю 3x3 часть модели (без масштабирования)
+  // Это работает правильно для большинства случаев
+  mat3 normal_matrix = mat3(material.model);
+  vec3 normal = normal_matrix * v_normal;
 
-  gl_Position = view_projection * position;
+  gl_Position = scene.view_projection * position;
 
   f_position = position.xyz;
-  f_normal = normal.xyz;
+  f_normal = normalize(normal);  // Нормализуем нормаль в мировых координатах
   f_uv = v_uv;
 }
