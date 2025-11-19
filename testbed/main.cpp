@@ -809,7 +809,7 @@ void initialize(VkCommandBuffer cmd) {
 			.position = {0.0f, 1.0f, 0.0f},
 			.scale = {-15.0f, 1.0f, 15.0f},
 		},
-		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f}  // Белая плоскость (не будет анимироваться)
+		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f}
 	});
 
 	// Куб
@@ -856,9 +856,7 @@ void update(double time) {
 	ImGui::ColorEdit3("Cube Color", &cube_color.x);
 	
 	// Slider для FOV камеры
-	if (camera.is_perspective) {
-		if (ImGui::SliderFloat("FOV", &camera.fov, 30.0f, 120.0f)) {
-		}
+	if (ImGui::SliderFloat("FOV", &camera.fov, 30.0f, 120.0f)) {
 	}
 	
 	// Slider для скорости вращения

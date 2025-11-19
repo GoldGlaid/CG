@@ -1,4 +1,9 @@
+#include <vulkan/vulkan_core.h>
+#include <veekay/veekay.hpp>
 #include "veekay/input.hpp"
+
+#include <imgui.h>
+#include <lodepng.h>
 #include <cstdint>
 #include <climits>
 #include <vector>
@@ -9,28 +14,7 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 
-#include <veekay/veekay.hpp>
-
-#include <imgui.h>
-#include <vulkan/vulkan_core.h>
-
-#include <lodepng.h>
-
 namespace {
-// ОСНОВНЫЕ ЗАДАНИЯ:
-// 1. Генерация тора (200 вершин) - generateTorusMesh()
-// 2. Анимация цвета через sin(time) - shaders/shader.frag
-// 3. Вращение тора вокруг оси
-// 4. UI элементы - update()
-// 5. Инициализация тора - initialize()
-//
-// ДОПОЛНИТЕЛЬНЫЕ ЗАДАНИЯ:
-// 1. Переключение проекции (перспективная/ортографическая):
-//    - Camera::orthographic()
-//    - Camera::view_projection()
-// 2. Управление анимацией (пауза и реверс):
-//    - update()
-
 
 constexpr uint32_t max_models = 1024;
 constexpr uint32_t max_point_lights = 16;
@@ -139,7 +123,6 @@ inline namespace {
 	std::vector<Model> models;
 	std::vector<PointLight> point_lights;  // Точечные источники света
 
-	// ДОПОЛНИТЕЛЬНЫЕ ЗАДАНИЯ
 	// UI variables for additional features
 	bool is_animation_paused = false;
 	bool is_rotation_reversed = false;
@@ -632,10 +615,6 @@ void initialize(VkCommandBuffer cmd) {
 					.descriptorCount = 8,
 				},
 				{
-					.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-					.descriptorCount = 8,
-				},
-				{
 					.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 					.descriptorCount = 8,
 				}
@@ -980,7 +959,7 @@ void initialize(VkCommandBuffer cmd) {
 		.mesh = cube_mesh,
 		.transform = Transform{
 			.position = {0.0f, 1.0f, 0.0f},
-			.scale = {15.0f, 1.0f, 15.0f},  // Убрал отрицательный scale для правильных нормалей
+			.scale = {100.0f, 1.0f, 100.0f},  // Убрал отрицательный scale для правильных нормалей
 		},
 		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f},  // Белая плоскость (не будет анимироваться)
 		.specular_color = veekay::vec3{0.5f, 0.5f, 0.5f},
@@ -1138,25 +1117,16 @@ void update(double time) {
 	//TODO: АНИМАЦИЯ
 	// Обновляем вращение тора вокруг своей оси (Y-axis)
 	if (!models.empty()) {
-		//тор1
-		int c = 0;
+		// int c = 0;
 		// for (float i = 0.0; i < 10.0; i += 0.05f) {
 		// 	models[c].transform.rotation.x = animation_time;
 		// 	models[c].transform.rotation.y = animation_time;
 		// 	models[c].transform.rotation.z = animation_time;
 		// 	c++;
 		// }
-		//тор2
-		c++;
-		models[0].transform.rotation.x = animation_time;
+
+		//тор
 		models[0].transform.rotation.y = animation_time;
-		models[0].transform.rotation.z = animation_time;
-
-		c++;
-		//платформа
-		models[1].transform.rotation.y = animation_time;
-
-		c++;
 		//куб
 		models[2].transform.rotation.y = animation_time * -1.0f;
 	}
