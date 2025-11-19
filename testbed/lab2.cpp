@@ -10,6 +10,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <algorithm>
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -35,10 +36,20 @@ struct PointLight {
 
 struct SceneUniforms {
 	veekay::mat4 view_projection;
-	float time;  // Для анимации цвета через sin(time)
-	uint32_t point_light_count;  // Количество активных точечных источников
-	veekay::vec3 camera_position;  // Позиция камеры для расчета view direction
+	veekay::vec3 view_position;  // Позиция камеры для расчета view direction
 	float _pad0;  // Выравнивание для std140
+	
+	veekay::vec3 ambient_light_intensity;  // Рассеянное освещение
+	float _pad1;  // Выравнивание для std140
+	
+	veekay::vec3 sun_light_direction;  // Направление направленного света
+	float _pad2;  // Выравнивание для std140
+	
+	veekay::vec3 sun_light_color;  // Цвет направленного света
+	float _pad3;  // Выравнивание для std140
+	
+	uint32_t point_light_count;  // Количество активных точечных источников
+	float time;  // Для анимации цвета через sin(time)
 };
 
 struct ModelUniforms {
@@ -96,9 +107,6 @@ struct Camera {
 	float near_plane = default_near_plane;
 	float far_plane = default_far_plane;
 
-	bool is_perspective = true;  // Доп. задание 1: флаг типа проекции
-	float ortho_size = 10.0f;     // Доп. задание 1: размер видимой области ортографической проекции
-
 	// NOTE: View matrix of camera (inverse of a transform)
 	veekay::mat4 view() const;
 
@@ -114,11 +122,22 @@ struct Camera {
 
 // NOTE: Scene objects
 inline namespace {
+	//===============================================
 	Camera camera{
-		.position = {0.0f, -1.0f, -10.0f},
-		.target = {0.0f, 0.0f, 0.0f},  // Смотрим в центр сцены
-		.up = {0.0f, 1.0f, 0.0f}
+		.position = {0.0f, 0.0f, 15.0f},
+		.target = {0.0f, -5.0f, 0.0f},  // Центр сцены (где находятся объекты)
+		.up = {0.0f, 1.0f, 0.0f},
+		.fov = 60.0f,
+		.near_plane = 0.1f,
+		.far_plane = 1000.0f  // Увеличено для большей дальности прорисовки
 	};
+
+
+	// Орбитальные параметры камеры
+	float orbit_radius = 0.0f;      // Радиус орбиты (будет вычислен из начальной позиции)
+	float orbit_yaw = 0.0f;         // Горизонтальный угол (в радианах)
+	float orbit_pitch = 0.0f;       // Вертикальный угол (в радианах)
+	//===============================================
 
 	std::vector<Model> models;
 	std::vector<PointLight> point_lights;  // Точечные источники света
@@ -128,6 +147,11 @@ inline namespace {
 	bool is_rotation_reversed = false;
 	float rotation_speed = 1.0f;      // UI: скорость вращения
 	float animation_time = 0.0f;       // Накопленное время анимации
+	
+	// Lighting parameters
+	veekay::vec3 ambient_light_intensity = {0.2f, 0.2f, 0.2f};
+	veekay::vec3 sun_light_direction = {0.0f, -1.0f, -0.5f};  // Будет нормализовано при использовании
+	veekay::vec3 sun_light_color = {1.0f, 1.0f, 1.0f};
 }
 
 // NOTE: Vulkan objects
@@ -244,13 +268,13 @@ Mesh generateTorusMesh(float majorRadius, float minorRadius,
 			
 			// Первый треугольник
 			indices.push_back(current);
-			indices.push_back(next);
 			indices.push_back(current + 1);
+			indices.push_back(next);
 			
 			// Второй треугольник
 			indices.push_back(current + 1);
-			indices.push_back(next);
 			indices.push_back(next + 1);
+			indices.push_back(next);
 		}
 	}
 	
@@ -269,7 +293,7 @@ Mesh generateTorusMesh(float majorRadius, float minorRadius,
 }
 
 veekay::mat4 Transform::matrix() const {
-	// Пполная матрица преобразования (scaling + rotation + translation)
+	// Полная матрица преобразования (scaling + rotation + translation)
 	
 	auto s = veekay::mat4::scaling(scale);
 	
@@ -278,7 +302,7 @@ veekay::mat4 Transform::matrix() const {
 	auto ry = veekay::mat4::rotation(veekay::vec3{0.0f, 1.0f, 0.0f}, rotation.y);
 	auto rz = veekay::mat4::rotation(veekay::vec3{0.0f, 0.0f, 1.0f}, rotation.z);
 	
-	auto r = rz * ry * rx;  // Порядок: сначала X, потом Y, потом Z
+	auto r = ry * rx * rz;  // Порядок: сначала X, потом Y, потом Z
 	
 	auto t = veekay::mat4::translation(position);
 	
@@ -287,140 +311,50 @@ veekay::mat4 Transform::matrix() const {
 }
 
 veekay::mat4 Camera::look_at() const {
-	// Look-At матрица: преобразует мировые координаты в координаты камеры
-	// eye = position, center = target, up = up
-	
-	veekay::vec3 f = target - position;  // Направление вперед (к target)
-	float len_f = sqrtf(f.x * f.x + f.y * f.y + f.z * f.z);
-	if (len_f > 0.0001f) {
-		f.x /= len_f;
-		f.y /= len_f;
-		f.z /= len_f;
-	} else {
-		f = {0.0f, 0.0f, -1.0f};  // По умолчанию смотрим назад (в направлении +Z в мире)
-	}
-	
-	// Вычисляем right вектор (cross(up, forward))
-	veekay::vec3 r;
-	r.x = up.y * f.z - up.z * f.y;
-	r.y = up.z * f.x - up.x * f.z;
-	r.z = up.x * f.y - up.y * f.x;
-	float len_r = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z);
-	if (len_r > 0.0001f) {
-		r.x /= len_r;
-		r.y /= len_r;
-		r.z /= len_r;
-	} else {
-		// Если up и forward параллельны, используем стандартный right
-		r = {1.0f, 0.0f, 0.0f};
-	}
-	
-	// Пересчитываем up вектор (cross(forward, right))
-	veekay::vec3 u;
-	u.x = f.y * r.z - f.z * r.y;
-	u.y = f.z * r.x - f.x * r.z;
-	u.z = f.x * r.y - f.y * r.x;
-	
-	// Строим Look-At матрицу (колоночная ориентация)
-	// В veekay матрицы хранятся колонками: result[0] = первая колонка (vec4)
-	// result[i][j] где i - номер колонки, j - индекс компонента vec4 (0=x, 1=y, 2=z, 3=w)
-	veekay::mat4 result = veekay::mat4::identity();
-	
-	// Первая колонка (right) - result[0] это vec4
-	result[0][0] = r.x;  // x компонент
-	result[0][1] = r.y;  // y компонент
-	result[0][2] = r.z;  // z компонент
-	result[0][3] = 0.0f; // w компонент
-	
-	// Вторая колонка (up) - result[1] это vec4
-	result[1][0] = u.x;
-	result[1][1] = u.y;
-	result[1][2] = u.z;
-	result[1][3] = 0.0f;
-	
-	// Третья колонка (-forward для камеры) - result[2] это vec4
-	result[2][0] = -f.x;
-	result[2][1] = -f.y;
-	result[2][2] = -f.z;
-	result[2][3] = 0.0f;
-	
-	// Четвертая колонка (translation) - result[3] это vec4
-	result[3][0] = -(r.x * position.x + r.y * position.y + r.z * position.z);
-	result[3][1] = -(u.x * position.x + u.y * position.y + u.z * position.z);
-	result[3][2] = (f.x * position.x + f.y * position.y + f.z * position.z);
-	result[3][3] = 1.0f;
-	
-	return result;
+
+	// forward - направление от камеры к target
+	veekay::vec3 f = veekay::vec3::normalized(target - position);
+	// right - перпендикуляр к forward и world up
+	veekay::vec3 r = veekay::vec3::normalized(veekay::vec3::cross(f, up));
+	// up - пересчитанный up вектор (перпендикуляр к right и forward)
+	veekay::vec3 u = veekay::vec3::cross(r, f);
+
+	veekay::mat4 view_matrix{};
+
+	// В column-major формате: result[j][i] = столбец j, строка i
+	// Столбец 0: right вектор
+	view_matrix[0][0] = r.x;
+	view_matrix[0][1] = r.y;
+	view_matrix[0][2] = r.z;
+	view_matrix[0][3] = 0.0f;
+
+	// Столбец 1: up вектор
+	view_matrix[1][0] = u.x;
+	view_matrix[1][1] = u.y;
+	view_matrix[1][2] = u.z;
+	view_matrix[1][3] = 0.0f;
+
+	// Столбец 2: -forward вектор (отрицательный, так как смотрим "назад")
+	view_matrix[2][0] = -f.x;
+	view_matrix[2][1] = -f.y;
+	view_matrix[2][2] = -f.z;
+	view_matrix[2][3] = 0.0f;
+
+	// Столбец 3: трансляция (отрицательная, так как это view matrix)
+	view_matrix[3][0] = -veekay::vec3::dot(r, position);
+	view_matrix[3][1] = -veekay::vec3::dot(u, position);
+	view_matrix[3][2] = -veekay::vec3::dot(f, position);
+	view_matrix[3][3] = 1.0f;
+
+	return view_matrix;
 }
 
 veekay::mat4 Camera::view() const {
-	// ВРЕМЕННО: Используем упрощенную версию, которая работает
-	// Потом можно будет добавить полный Look-At
-	auto t = veekay::mat4::translation(-position);
-	return t;
-	
-	// TODO: Включить Look-At когда будет исправлен
-	// return look_at();
-}
-
-// доп. задание 1: Ортографическая проекция
-
-// Ортографическая проекция работает следующим образом:
-// - В отличие от перспективной проекции, ортографическая проецирует объекты параллельными лучами
-// - Объекты не становятся меньше с расстоянием (нет перспективного искажения)
-// - Параметры left, right, bottom, top определяют видимую область (видимый объем)
-// - near и far определяют диапазон глубины
-// - Матрица ортографической проекции преобразует координаты из видимого объема в NDC (Normalized Device Coordinates) [-1, 1]
-
-veekay::mat4 Camera::orthographic(float aspect_ratio) const {
-	veekay::mat4 result{};
-	
-	// Вычисляем размеры для ортографической проекции
-	// Используем настраиваемый размер видимой области из camera.ortho_size
-	float height = ortho_size;  // Размер видимой области (половина высоты)
-	float width = height * aspect_ratio;  // Ширина пропорциональна высоте и aspect ratio
-	
-	// Ортографическая матрица проекции
-	// Определяем границы видимого объема (фрустума)
-	float l = -width;   // left
-	float r = width;     // right
-	float b = -height;   // bottom
-	float t = height;    // top
-	float n = near_plane; // near
-	float f = far_plane;  // far
-	
-	// Ортографическая матрица проекции (для Vulkan с Z в [0, 1]):
-	// Перспективная проекция использует: result[2][2] = far/(far-near), result[3][2] = (-near*far)/(far-near)
-	// Это формула для Vulkan с Z в диапазоне [0, 1] в NDC
-	
-	result[0][0] = 2.0f / (r - l);
-	result[0][1] = 0.0f;
-	result[0][2] = 0.0f;
-	result[0][3] = 0.0f;
-	
-	result[1][0] = 0.0f;
-	result[1][1] = 2.0f / (t - b);
-	result[1][2] = 0.0f;
-	result[1][3] = 0.0f;
-
-	result[2][0] = 0.0f;
-	result[2][1] = 0.0f;
-	result[2][2] = 1.0f / (f - n);  // Для Z в [0, 1], как в перспективной проекции
-	result[2][3] = 0.0f;
-	
-	result[3][0] = -(r + l) / (r - l);   // Смещение по X для центрирования
-	result[3][1] = -(t + b) / (t - b);   // Смещение по Y для центрирования
-	result[3][2] = -n / (f - n);         // Смещение по Z для Vulkan
-	result[3][3] = 1.0f;
-	
-	return result;
+	return look_at();
 }
 
 veekay::mat4 Camera::view_projection(float aspect_ratio) const {
-	// Доп. задание 1: Выбор типа проекции
-	veekay::mat4 proj = is_perspective 
-		? veekay::mat4::projection(fov, aspect_ratio, near_plane, far_plane)
-		: orthographic(aspect_ratio);
+	auto proj = veekay::mat4::projection(fov, aspect_ratio, near_plane, far_plane);
 
 	return view() * proj;
 }
@@ -450,9 +384,34 @@ VkShaderModule loadShaderModule(const char* path) {
 	return result;
 }
 
+// Обновляет позицию камеры на основе орбитальных параметров
+void updateCameraPosition();
+
 void initialize(VkCommandBuffer cmd) {
 	VkDevice& device = veekay::app.vk_device; // Интерфейс для общения с видеокартой
-	VkPhysicalDevice& physical_device = veekay::app.vk_physical_device; //физические параметры видюхи
+	VkPhysicalDevice& physical_device = veekay::app.vk_physical_device; // физические параметры видюхи
+	
+	// Центр сцены
+	camera.target = {0.0f, -5.0f, 0.0f};
+
+	// Инициализация орбитальных параметров камеры из начальной позиции
+	//===========================================
+	veekay::vec3 offset = camera.position - camera.target;
+	orbit_radius = veekay::vec3::length(offset);
+
+	if (orbit_radius < 0.5f) {
+		orbit_radius = 15.0f;
+		orbit_yaw = 0.0f;
+		orbit_pitch = 0.0f;
+	} else {
+		// Вычисляем углы из начальной позиции камеры
+		// Нормализуем offset для безопасности
+		veekay::vec3 normalized_offset = veekay::vec3::normalized(offset);
+		orbit_pitch = asinf(normalized_offset.y);
+		orbit_yaw = atan2f(normalized_offset.x, normalized_offset.z);
+	}
+	//===========================================
+
 
 	{ // NOTE: Build graphics pipeline
 		vertex_shader_module = loadShaderModule("./shaders/shader.vert.spv");
@@ -915,14 +874,9 @@ void initialize(VkCommandBuffer cmd) {
 		cube_mesh.indices = uint32_t(indices.size());
 	}
 
-	// Инициализация тора
-	// Генерируем тор с ~200 вершинами
-	// majorSegments * minorSegments должно дать примерно 200 вершин
-	// Например: 12 * 16 = 192 вершины (13 * 17 = 221 вершина)
 	torus_mesh = generateTorusMesh(1.5f, 0.5f, 12, 16);
 
 	// NOTE: Add models to scene
-
 	models.clear();
 	//TODO: МОДЕЛЬКИ
 	// for (float i = 0.0; i < 10.0; i += 0.05f) {
@@ -959,7 +913,7 @@ void initialize(VkCommandBuffer cmd) {
 		.mesh = cube_mesh,
 		.transform = Transform{
 			.position = {0.0f, 1.0f, 0.0f},
-			.scale = {100.0f, 1.0f, 100.0f},  // Убрал отрицательный scale для правильных нормалей
+			.scale = {50.0f, 1.0f, 15.0f},
 		},
 		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f},  // Белая плоскость (не будет анимироваться)
 		.specular_color = veekay::vec3{0.5f, 0.5f, 0.5f},
@@ -997,6 +951,10 @@ void initialize(VkCommandBuffer cmd) {
 		.color = {0.0f, 0.0f, 1.0f},
 		._pad0 = 0.0f
 	});
+
+	// Обновляем позицию камеры на основе вычисленных орбитальных параметров
+	updateCameraPosition();
+
 }
 
 // NOTE: Destroy resources here, do not cause leaks in your program!
@@ -1028,43 +986,37 @@ void shutdown() {
 	vkDestroyShaderModule(device, vertex_shader_module, nullptr);
 }
 
-void update(double time) {
+void updateCameraPosition() {
+	// Ограничиваем pitch, чтобы камера не переворачивалась
+	constexpr float min_pitch = -float(M_PI) / 2.0f + 0.1f;  // -90 градусов
+	constexpr float max_pitch = float(M_PI) / 2.0f - 0.1f;   //  +90 градусов
+	orbit_pitch = std::max(min_pitch, std::min(max_pitch, orbit_pitch));
+	
+	// Сферические координаты: x = r * cos(pitch) * cos(yaw)
+	//                        y = r * sin(pitch)
+	//                        z = r * cos(pitch) * sin(yaw)
+	float cos_pitch = cosf(orbit_pitch);
+	camera.position.x = camera.target.x + orbit_radius * cosf(orbit_yaw) * cos_pitch;
+	camera.position.y = camera.target.y + orbit_radius * sinf(orbit_pitch);
+	camera.position.z = camera.target.z + orbit_radius * sinf(orbit_yaw) * cos_pitch;
+}
 
+
+void update(double time) {
 	ImGui::Begin("Controls:");
 	ImGui::ColorEdit3("Cube Color", &cube_color.x);
 	
 	// Slider для FOV камеры
-	if (camera.is_perspective) {
-		if (ImGui::SliderFloat("FOV", &camera.fov, 30.0f, 120.0f)) {
-		}
+
+	if (ImGui::SliderFloat("FOV", &camera.fov, 30.0f, 120.0f)) {
 	}
 	
 	// Slider для скорости вращения
 	if (ImGui::SliderFloat("Rotation Speed", &rotation_speed, 0.0f, 100.0f)) {
 	}
-	
-	// ДОП. ЗАДАНИЕ 1: Переключение проекции
-	if (ImGui::Checkbox("Perspective Projection", &camera.is_perspective)) {
-	}
-
 	ImGui::SameLine();
-	if (!camera.is_perspective) {
-		ImGui::Text("(Orthographic)");
-	}
 
-	// UI для настройки размера ортографической проекции
-	if (!camera.is_perspective) {
-		if (ImGui::SliderFloat("Orthographic Size", &camera.ortho_size, 1.0f, 50.0f)) {
-			// Размер видимой области ортографической проекции обновляется напрямую
-
-		}
-		// Доп инфа
-		ImGui::Text("Visible area: %.1f x %.1f (X x Y)", 
-		           camera.ortho_size * 2.0f, 
-		           camera.ortho_size * 2.0f);
-	}
-	
-	// ДОП. ЗАДАНИЕ 2: Управление анимацией
+	// Управление анимацией
 	if (ImGui::Checkbox("Pause Animation", &is_animation_paused)) {
 		// Пауза/возобновление анимации
 	}
@@ -1108,23 +1060,31 @@ void update(double time) {
 	
 	ImGui::End();
 
+	// UI для управления рассеянным и направленным освещением
+	ImGui::Begin("Lighting");
+	ImGui::Text("Ambient Light");
+	ImGui::ColorEdit3("Ambient Intensity", &ambient_light_intensity.x);
+	
+	ImGui::Separator();
+	ImGui::Text("Directional Light (Sun)");
+	ImGui::SliderFloat3("Direction", &sun_light_direction.x, -1.0f, 1.0f);
+	ImGui::ColorEdit3("Sun Color", &sun_light_color.x);
+	
+	// Кнопка для сброса направления к значению по умолчанию
+	if (ImGui::Button("Reset Direction")) {
+		sun_light_direction = {0.0f, -1.0f, -0.5f};
+	}
+	
+	ImGui::End();
+
 	// ДОП. ЗАДАНИЕ 2: Анимация вращения
 	// Обновляем накопленное время анимации (если не на паузе)
 	if (!is_animation_paused) {
 		animation_time = time * rotation_speed * (is_rotation_reversed ? -1.0f : 1.0f);
 	}
-	// Если на паузе, animation_time не меняется (сохраняется последнее значение)
-	//TODO: АНИМАЦИЯ
-	// Обновляем вращение тора вокруг своей оси (Y-axis)
-	if (!models.empty()) {
-		// int c = 0;
-		// for (float i = 0.0; i < 10.0; i += 0.05f) {
-		// 	models[c].transform.rotation.x = animation_time;
-		// 	models[c].transform.rotation.y = animation_time;
-		// 	models[c].transform.rotation.z = animation_time;
-		// 	c++;
-		// }
 
+	//TODO: АНИМАЦИЯ
+	if (!models.empty()) {
 		//тор
 		models[0].transform.rotation.y = animation_time;
 		//куб
@@ -1134,37 +1094,37 @@ void update(double time) {
 	if (!ImGui::IsWindowHovered()) {
 		using namespace veekay::input;
 
-		// if (mouse::isButtonDown(mouse::Button::left)) {
-			auto move_delta = mouse::cursorDelta();
+		constexpr float rotation_speed = 0.02f;  // Скорость вращения камеры
+		constexpr float zoom_speed = 0.5f;        // Скорость приближения/отдаления
 
-			// TODO: Use mouse_delta to update camera rotation
-			
-			auto view = camera.view();
+		// W/S - изменение pitch (вертикальный угол)
+		if (keyboard::isKeyDown(keyboard::Key::w))
+			orbit_pitch += rotation_speed;
 
-			// TODO: Calculate right, up and front from view matrix
-			veekay::vec3 right = {1.0f, 0.0f, 0.0f};
-			veekay::vec3 up = {0.0f, -1.0f, 0.0f};
-			veekay::vec3 front = {0.0f, 0.0f, 1.0f};
+		if (keyboard::isKeyDown(keyboard::Key::s))
+			orbit_pitch -= rotation_speed;
 
-			if (keyboard::isKeyDown(keyboard::Key::w))
-				camera.position += front * 0.1f;
+		// A/D - изменение yaw (горизонтальный угол)
+		if (keyboard::isKeyDown(keyboard::Key::a))
+			orbit_yaw -= rotation_speed;
 
-			if (keyboard::isKeyDown(keyboard::Key::s))
-				camera.position -= front * 0.1f;
+		if (keyboard::isKeyDown(keyboard::Key::d))
+			orbit_yaw += rotation_speed;
 
-			if (keyboard::isKeyDown(keyboard::Key::d))
-				camera.position += right * 0.1f;
-
-			if (keyboard::isKeyDown(keyboard::Key::a))
-				camera.position -= right * 0.1f;
-
-			if (keyboard::isKeyDown(keyboard::Key::q))
-				camera.position += up * 0.1f;
-
-			if (keyboard::isKeyDown(keyboard::Key::z))
-				camera.position -= up * 0.1f;
+		// Q/Z - изменение радиуса (приближение/отдаление)
+		if (keyboard::isKeyDown(keyboard::Key::q)) {
+			orbit_radius -= zoom_speed;
+			if (orbit_radius < 1.0f) orbit_radius = 1.0f;  // Минимальный радиус
 		}
-	// }
+
+		if (keyboard::isKeyDown(keyboard::Key::z)) {
+			orbit_radius += zoom_speed;
+			if (orbit_radius > 500.0f) orbit_radius = 500.0f;  // Максимальный радиус увеличен
+		}
+	}
+
+	// Камера должна обновляться каждый кадр, даже когда ввод заблокирован UI
+	updateCameraPosition();
 
 	float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
 	
@@ -1183,10 +1143,16 @@ void update(double time) {
 	// Добавить время в uniform
 	SceneUniforms scene_uniforms{
 		.view_projection = camera.view_projection(aspect_ratio),
-		.time = static_cast<float>(time),  // Передаем время для анимации цвета
+		.view_position = camera.position,
+		._pad0 = 0.0f,
+		.ambient_light_intensity = ambient_light_intensity,
+		._pad1 = 0.0f,
+		.sun_light_direction = veekay::vec3::normalized(sun_light_direction),
+		._pad2 = 0.0f,
+		.sun_light_color = sun_light_color,
+		._pad3 = 0.0f,
 		.point_light_count = active_light_count,
-		.camera_position = camera.position,
-		._pad0 = 0.0f
+		.time = static_cast<float>(time)  // Передаем время для анимации цвета
 	};
 
 	std::vector<ModelUniforms> model_uniforms(models.size());

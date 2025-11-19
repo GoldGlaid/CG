@@ -13,10 +13,20 @@ layout (location = 0) out vec4 final_color;
 
 layout (binding = 0, std140) uniform SceneUniforms {
   mat4 view_projection;
-  float time;  // Время для анимации цвета
-  uint point_light_count;  // Количество активных точечных источников
-  vec3 camera_position;  // Позиция камеры для расчета view direction
+  vec3 view_position;  // Позиция камеры для расчета view direction
   float _pad0;
+  
+  vec3 ambient_light_intensity;  // Рассеянное освещение
+  float _pad1;
+  
+  vec3 sun_light_direction;  // Направление направленного света
+  float _pad2;
+  
+  vec3 sun_light_color;  // Цвет направленного света
+  float _pad3;
+  
+  uint point_light_count;  // Количество активных точечных источников
+  float time;  // Время для анимации цвета
 } scene;
 
 layout (binding = 1, std140) uniform ModelUniforms {
@@ -60,14 +70,24 @@ void main() {
   vec3 material_specular = material.specular_color;
   float material_shininess = material.shininess;
 
+  // Нормализуем нормаль
+  vec3 normal = normalize(f_normal);
+  
   // Направление к камере (view direction)
-  vec3 view_dir = normalize(scene.camera_position - f_position);
+  vec3 view_dir = normalize(scene.view_position - f_position);
 
-  // Базовое ambient освещение (увеличено для видимости)
-  vec3 ambient = material_albedo * 0.3;
+  // Рассеянное освещение из uniforms
+  vec3 ambient = scene.ambient_light_intensity;
+
+  // Направленное освещение (солнце) по модели Блинн-Фонга
+  vec3 half_vector = normalize(view_dir - scene.sun_light_direction);
+  float sun_shade = max(0.0, -dot(scene.sun_light_direction, normal));
+  vec3 sun_diffuse = material_albedo;  // Без умножения на sun_light_color (применяется в итоговой формуле)
+  vec3 sun_specular = material_specular * pow(max(0.0, dot(normal, half_vector)), material_shininess);
+  vec3 sun_light_intensity = sun_shade * scene.sun_light_color * (sun_diffuse + sun_specular);
 
   // Инициализируем итоговый цвет
-  vec3 result = ambient;
+  vec3 result = ambient + sun_light_intensity;
 
   // Обрабатываем каждый точечный источник света
   if (scene.point_light_count > 0) {
@@ -83,12 +103,12 @@ void main() {
       float attenuation = light.intensity / (distance * distance + 0.01);
       
       // Diffuse компонент
-      float diff = max(dot(f_normal, light_dir), 0.0);
+      float diff = max(dot(normal, light_dir), 0.0);
       vec3 diffuse = diff * material_albedo * light.color;
       
       // Specular компонент (Блинн-Фонг)
       vec3 half_dir = normalize(light_dir + view_dir);
-      float spec = pow(max(dot(f_normal, half_dir), 0.0), material_shininess);
+      float spec = pow(max(dot(normal, half_dir), 0.0), material_shininess);
       vec3 specular = spec * material_specular * light.color;
       
       // Суммируем вклад источника света
