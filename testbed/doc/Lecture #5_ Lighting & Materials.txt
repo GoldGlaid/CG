@@ -1,0 +1,569 @@
+C O M P U T E R    G R A P H I C S
+Lighting & Materials
+
+
+Освещение
+Для выполнения операций освещения необходимо определить, сколько света доступно в сцене. Для этого требуется смоделировать источники света и добавить их как-то на сцену
+В традиционных системах освещения  используются 3 различных абстрактных типа, которые представляют различные ситуации освещения: 
+точечные источники света
+прожекторные источники света
+направленные источники света
+
+Направленный источник света – моделируется как бесконечно удаленный, поскольку все его лучи света имеют одно и то же направление; оно не зависит от местоположения источника света
+Направленный источник света
+Когда источник света находится далеко, лучи света, исходящие от него, почти параллельны друг другу
+Кажется, что все лучи света исходят из одного направления, независимо от того, где находится объект и/или наблюдатель
+Хорошим примером направленного источника света является наше солнце
+
+Точечный источник света
+Точечный источник света — это просто точка в пространстве, которая излучает свет равномерно во всех направлениях вокруг себя
+Точечный источник света имеет:
+положения в пространстве
+количества излучаемого им света
+сила затухания
+Сила затухания используется для определения того, как яркость света уменьшается по мере удаления от источника света (пропорционально квадрату расстояния)
+
+Прожекторный источник света
+Прожекторный источник света — это источник света, расположенный в пространстве, который вместо того, чтобы излучать лучи света во всех направлениях, излучает их только в определенном направлении
+В результате освещаются только объекты, находящиеся в определенном радиусе от направления прожектора, а все остальное остается в темноте
+Примером прожектора может служить уличный фонарь или фонарик
+
+Модель освещения Блинн-Фонга
+           видимый свет по вектору направления наблюдения
+          свет (интенсивность цвета источника) от точки по направлению
+    нормаль точки поверхности
+     альбедо (цвет) диффузного компонента материала 
+     цвет отраженной компоненты материала от ист. света
+     параметр блеска материала поверхности
+                       половинчатый вектор, направление
+                       между вектором наблюдения и ист. света
+
+Ламбертовый (диффузный) материал
+По закону Ламберта: яркость идеально рассеивающей свет (диффузной) поверхности одинакова во всех направлениях
+Так можно дёшево аппроксимировать базовый цвет материала поверхности (мы это уже делаем, задавая сплошной цвет модели или интерполируя цвет между вершинами)
+ 
+                       (I0 – сила света плоской поверхности)
+
+Ламбертовый (диффузный) материал
+
+Отражающий материал
+
+Отражающий материал
+
+Отражающий материал по Блинн-Фонгу
+
+Параметр блеска материала
+
+Рассеянный свет
+Рассеянный свет (ambient) аппроксимирует свет, который исходит отовсюду из окружения сцены
+Поскольку окружающий свет не имеет направления, он равномерно взаимодействует со всеми поверхностями, а его интенсивность определяется силой источников окружающего света и свойствами материалов поверхности объектов
+
+Рассеянный свет
+
+Всё вместе!
+Ambient
+Specular
+Diffuse
+
+Мы уходим от push constants!
+Механизм push constants был очень полезен, когда нужно было быстро пробросить невершинные данные в шейдеры, например матрицы
+Одной командой можно было скопировать данные из RAM в VRAM без головной боли и аллокаций буферов
+У push constants существуют жесткие ограничения по размеру и, в зависимости от вендора GPU и драйвера, этот размер может быть 128 байт – самый маленький по спецификации Vulkan API
+Push constants не поддерживают массивы, а они нам нужны, поскольку инфу про источники света мы должны брать извне и их у нас не фиксированное количество
+Теперь познакомимся с системой descriptor set и использованием буферов для хранения произвольного количества данных!
+Приготовились! Будет ЕЩЁ БОЛЬШЕ кода на Vulkan!
+
+Descriptor pool (пул дескрипторов ресурсов)
+Descriptor pool описывает, какие внешние для шейдеров ресурсы можно выделить и сколько
+В нашем случае, мы хотим выделить ресурсы в виде буферов для хранения данных (uniform buffer и dynamic uniform buffer)
+VkDescriptorPoolSize pools[] = {
+{
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 8,
+	},
+	{
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.descriptorCount = 8,
+	},
+};	
+
+Создание Descriptor pool
+VkDescriptorPool vk_descriptor_pool;
+
+VkDescriptorPoolCreateInfo info{
+	.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	.maxSets = 1, // Сколько наборов можно выделить, нам нужен 1
+	.poolSizeCount = sizeof(pools) / sizeof(pools[0]),
+	.pPoolSizes = pools,
+};
+
+vkCreateDescriptorPool(device, &info, nullptr,
+			            &vk_descriptor_pool);
+
+
+Описание используемых ресурсов в граф. конвейере
+VkDescriptorSetLayoutBinding bindings[] = {
+{ // Буфер для матрицы камеры и параметров сцены, общий для всех моделей
+		.binding = 0, // В шейдере имеет индекс 0
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | 
+                       VK_SHADER_STAGE_FRAGMENT_BIT,
+},
+{ // Буфер для матриц моделей и параметров материалов, индивидуальный
+		.binding = 1, // В шейдере имеет индекс 1
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | 
+                       VK_SHADER_STAGE_FRAGMENT_BIT,
+	},
+	... // Далее можем задать ещё
+};
+
+Создание объекта описания исп. ресурсов
+VkDescriptorSetLayout vk_descriptor_set_layout;
+
+VkDescriptorSetLayoutCreateInfo info{
+	.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	.bindingCount = sizeof(bindings) / sizeof(bindings[0]),
+	.pBindings = bindings,
+};
+
+vkCreateDescriptorSetLayout(device, &info, nullptr,
+			                 &vk_descriptor_set_layout);
+
+// Верхняя граница моделей, которые мы хотим отрисовать
+constexpr uint32_t max_models = 1024;
+
+// Буфер для инфы про сцену и матрицы камеры
+auto scene_uniform_buffer = new veekay::graphics::Buffer(
+sizeof(SceneUniforms),
+nullptr, // Просто выделяю, не инициализирую память
+VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+// Буфер для инфы про все модели и их материалы
+auto model_uniform_buffer = new veekay::graphics::Buffer(
+max_models * sizeof(ModelUniforms),
+nullptr,
+VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+Выделение буферов
+
+VkDescriptorBufferInfo buffer_infos[] = {
+	{
+		.buffer = scene_uniform_buffer->buffer,
+		.offset = 0,
+		.range = sizeof(SceneUniforms),
+	},
+	{
+		.buffer = model_uniform_buffer->buffer,
+		.offset = 0,
+		.range = sizeof(ModelUniforms),
+	},
+};
+
+Описание буферов для набора дескрипторов
+
+VkWriteDescriptorSet write_infos[] = {
+	{
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = vk_descriptor_set, // К какому набору дескрипторов принадлежит
+		.dstBinding = 0,             // В какой индекс сопоставить буфер и деск.
+		.descriptorCount = 1,        // Один дескриптор на буфер
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, // Тип дескриптора
+		.pBufferInfo = &buffer_infos[0], // Адрес описания буфера, чтобы связать
+	},
+	{
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = vk_descriptor_set,
+		.dstBinding = 1,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.pBufferInfo = &buffer_infos[1],
+	},
+};
+Сопоставление буферов с дескрипторами в наборе
+
+vkUpdateDescriptorSets(device,
+sizeof(write_infos) / sizeof(write_infos[0]),
+write_infos, 0, nullptr);
+
+Если нужно перевязать дескриптор (индекс ресурса) с другим буфером, то придётся вызвать эту функцию с новыми данными 
+Связываем буферы с дескрипторами в наборе
+
+VkPipelineLayout vk_pipeline_layout;
+
+VkPipelineLayoutCreateInfo layout_info{
+	.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	.pushConstantRangeCount = 1,            // Теперь можно убрать
+	.pPushConstantRanges = &push_constants, // VkPushConstantRange
+	.setLayoutCount = 1,
+	.pSetLayouts = &vk_descriptor_set_layout,
+};
+
+vkCreatePipelineLayout(device, &layout_info, nullptr, 
+                       &vk_pipeline_layout);
+
+Рассказываем граф. конвейеру о наборе дескрипторов
+
+// В функции update
+
+SceneUniforms scene_uniforms{
+	.view_projection = camera.matrix(aspect_ratio),
+};
+
+// Копируем данные в отображенную память буфера
+*(SceneUniforms*)camera_uniform_buffer->mapped_region = scene_uniforms;
+
+В Veekay теперь есть Buffer, который имеет адрес на отображенную память (mapped_region)
+Можно использовать memcpy или std::copy, если это массив
+Как изменять буферы?
+
+vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline);
+VkDeviceSize offset = 0;
+
+vkCmdBindVertexBuffers(cmd, 0, 1, &cube_vertex_buffer->buffer, &offset);
+vkCmdBindIndexBuffer(cmd, cube_index_buffer->buffer, offset, VK_INDEX_TYPE_UINT32);
+
+// Вместо vkCmdPushConstants
+vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        vk_pipeline_layout, 0, 1, 
+                        &vk_descriptor_set, 0, nullptr);
+
+vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+Как использовать набор дескрипторов при отрисовке?
+
+Так теперь делать нельзя!
+
+ModelUniforms model_uniforms = { cube_transform.matrix() };
+*(ModelUniforms*)model_uniform_buffer->mapped_region = model_uniforms;
+
+vkCmdBindVertexBuffers(cmd, 0, 1, 
+                       &cube_vertex_buffer->buffer, &offset);
+vkCmdBindIndexBuffer(cmd, cube_index_buffer->buffer, 
+                     offset, VK_INDEX_TYPE_UINT32);
+
+vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        vk_pipeline_layout, 0, 1, 
+                        &vk_descriptor_set, 0, nullptr);
+
+vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+А как изменить матрицы моделей?
+
+Как теперь жить?
+Вспоминаем, что функции vkCmdXXX только лишь записывают команды, а не исполняют их!
+Исполнение этих команд будет произведено после вызова функции VkQueueSubmit (эта функция используется в veekay.cpp в конце цикла программы и исполняет команды, которые были записаны в функции render вашего приложения)
+Поэтому если мы рисуем больше одного объекта, то применится последнее копирование в буфер, потому что оно там оказалось сразу после VkQueueSubmit 
+vkCmdPushConstants мы убрали, менять данные во время записи команд теперь нельзя
+Именно поэтому мы выделили буфер моделей достаточно большим и сделали его UNIFORM_BUFFER_DYNAMIC, чтобы при vkCmdBindDescriptorSets можно было выбрать сдвиг в этом буфере, который соотносится с данными о конкретной модели
+
+Заранее заполняем данные о моделях
+// В функции update
+
+ModelUniform model_uniforms[] = {
+	{cube_transform.matrix()},
+	{plane_transform.matrix()},
+	...
+};
+
+// Копируем данные в отображенную память буфера
+memcpy(model_uniform_buffer->mapped_region, model_uniforms,
+       sizeof(model_uniforms));
+
+
+Немножко рефакторинга
+struct Mesh {
+	veekay::graphics::Buffer* vertex_buffer;
+	veekay::graphics::Buffer* index_buffer;
+	uint32_t indices;
+};
+
+std::vector<Mesh> meshes;
+
+
+Немножко рефакторинга
+// В функции render
+VkDeviceSize zero_offset = 0;
+for (size_t i = 0, e = meshes.size(); i != e; ++i) {
+const Mesh& mesh = meshes[i];
+
+	vkCmdBindVertexBuffers(cmd, 0, 1, &mesh.vertex_buffer->buffer, &zero_offset);
+	vkCmdBindIndexBuffer(cmd, mesh.index_buffer->buffer, zero_offset, VK_INDEX_TYPE_UINT32);
+
+	uint32_t offset = i * sizeof(ModelUniforms); // i-ая инфа о модели в буфере с инфами о моделях
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+			             0, 1, &vk_descriptor_set, 1, &offset);
+
+	vkCmdDrawIndexed(cmd, mesh.indices, 1, 0, 0, 0);
+}
+
+Теперь меняем шейдер(-ы)
+layout(location = 0) in vec3 v_position;
+layout(location = 1) in vec3 v_color;
+
+layout(location = 0) out vec3 f_color;
+
+layout(binding = 0, std140) uniform SceneUniforms {
+	mat4 view_projection;
+};
+
+layout(binding = 1, std140) uniform ModelUniforms {
+	mat4 model;
+};
+
+void main() {
+	gl_Position = view_projection * model * vec4(v_position, 1.0f);
+
+	f_color = v_color;
+}
+
+Добавим рассеянное и направленное освещение
+struct SceneUniforms {
+	veekay::mat4 view_projection;
+	// Позиция камеры для вектора V при расчете отраженного света
+	veekay::vec3 view_position; float _pad0;
+
+	veekay::vec3 ambient_light_intensity; float _pad1;
+
+	veekay::vec3 sun_light_direction; float _pad2;
+	veekay::vec3 sun_light_color; float _pad3;
+};
+
+
+Моделируем свойство материала
+struct ModelUniforms {
+	veekay::mat4 model;
+
+	veekay::vec3 albedo_color; float _pad0;
+	veekay::vec3 specular_color; float _pad1;
+	float shininess; 
+};
+
+
+Передадим данные из вершинного шейдера далее
+layout(location = 0) in vec3 v_position;
+layout(location = 1) in vec3 v_color;
+layout(location = 2) in vec3 v_normal;
+
+layout(location = 0) out vec3 f_color;
+layout(location = 1) out vec3 f_position; // Интерполированная позиция точках на треугольнике
+layout(location = 2) out vec3 f_normal; // Интерполированная нормаль в точках в треугольника
+
+// Uniform definitions skipped in this example, but actually needed in practice
+
+void main() {
+	vec4 position = model * vec4(v_position, 1.0f);
+	vec4 normal = model * vec4(v_normal, 0.0f); // Нам нужен вектор, а не точка
+
+	gl_Position = view_projection * position;
+
+	f_color = v_color;
+	f_position = position.xyz; // Экспортируем значения далее в фрагментный шейдер, где
+	f_normal = normal.xyz;     // импортируемые будут интерполированы по каждому пикселю точки 
+}                                // треугольника
+
+Получаем данные из вершинного шейдера
+layout(location = 0) in vec3 f_color;
+layout(location = 1) in vec3 f_position;
+layout(location = 2) in vec3 f_normal;
+
+layout(location = 0) out vec4 final_color;
+
+layout(binding = 0, std140) uniform SceneUniforms {
+	mat4 view_projection;
+vec3 view_position;
+	vec3 ambient_light_intensity;
+	vec3 sun_light_direction;
+	vec3 sun_light_color;
+};
+
+layout(binding = 1, std140) uniform ModelUniforms {
+	mat4 model;
+vec3 albedo_color;
+vec3 specular_color;
+float shininess;	
+};
+
+Освещаем освещением в фрагментном шейдере
+void main() {
+	vec3 normal = normalize(f_normal);
+
+	vec3 view_dir = normalize(view_position - f_position);
+	vec3 half_vector = normalize(view_dir - sun_light_direction);
+
+	float sun_shade = max(0.0f, -dot(sun_light_direction, normal));
+	vec3 sun_diffuse = f_color * albedo_color;
+	vec3 sun_specular = specular_color * 
+                        pow(max(0.0f, dot(normal, half_vector)), 
+                            shininess);
+	vec3 sun_light_intensity = sun_shade * sun_light_color * 
+                               (sun_diffuse + sun_specular) ;
+
+	vec3 color = ambient_light_intensity + sun_light_intensity;
+}
+
+Моделируем источники света
+
+struct PointLight {
+	veekay::vec3 position;
+	float radius;
+	veekay::vec3 color; float _pad0;
+};
+
+
+std::vector<PointLight> point_lights;
+struct SpotLight {
+	veekay::vec3 position;
+	float radius;
+	veekay::vec3 direction;
+	float angle; // Косинус угла
+veekay::vec3 color; float _pad0;
+};
+
+std::vector<SpotLight> spot_lights;
+
+Не забывайте копировать данные из этих массивов в mapped_region соответствующих буферов! (Напоминаю, делать это нужно в update)
+
+Аналогично в фрагментном шейдере
+
+struct PointLight {
+	vec4 position_radius;
+	vec3 color;
+};
+
+
+
+layout(binding = 2, std430) readonly buffer PointLights {
+	PointLight point_lights[];
+};
+
+layout(binding = 3, std430) readonly buffer SpotLights {
+	SpotLight spot_lights[];
+};
+struct SpotLight {
+	vec4 position_radius;
+	vec4 direction_angle;
+	vec3 color;
+};
+
+Новый тип буферов (shader storage buffer)
+VkDescriptorPoolSize pools[] = {
+	// ...к существующим типам добавим еще один, storage buffer 
+	{
+		.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.descriptorCount = 8,
+	},
+};
+
+VkDescriptorSetLayoutBinding bindings[] = {
+	// ...к существующим дескрипторам добавим ещё
+	{
+		.binding = 2,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	},
+...
+};
+Добавим новые дескрипторы
+
+constexpr uint32_t max_point_lights = 16;
+constexpr uint32_t max_spot_lights = 16;
+
+auto point_lights_buffer = new veekay::graphics::Buffer(
+max_point_lights * sizeof(PointLight), 
+nullptr,
+	VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+auto spot_lights_buffer = new veekay::graphics::Buffer(
+max_spot_lights * sizeof(SpotLight), 
+nullptr,
+	VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+Создадим буферы под источники света
+
+Опишем сопоставления для буферов
+VkDescriptorBufferInfo buffer_infos[] = {
+	// ...к существующим описаниям добавим ещё
+	{
+		.buffer = point_lights_buffer->buffer,
+		.range = max_point_lights * sizeof(PointLight),
+	},
+	...
+}
+
+VkWriteDescriptorSet write_infos[] = {
+	// ...к существующим соответствиям добавим ещё
+{
+		.dstBinding = 2,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.pBufferInfo = &buffer_infos[2],
+	},
+...
+};
+
+
+Добавим количество источников в инфу о сцене 
+struct SceneUniforms {
+	veekay::mat4 view_projection;
+	veekay::vec3 view_position; float _pad0;
+
+	veekay::vec3 ambient_light_intensity; float _pad1;
+
+	veekay::vec3 sun_light_direction; float _pad2;
+	veekay::vec3 sun_light_color; float _pad3;
+
+	uint32_t point_lights_count;
+	uint32_t spot_lights_count;
+};
+
+
+Наконец-то, мы опять во фрагментном шейдере
+layout(binding = 0, std140) uniform SceneUniforms {
+	mat4 view_projection;
+	vec3 view_position;
+
+	vec3 ambient_light_intensity;
+
+	vec3 sun_light_direction;
+	vec3 sun_light_color;
+
+	uint point_light_count;
+	uint spot_light_count;
+};
+
+
+Теперь замиксуем точечные источники
+vec3 color = ambient_light_intensity + sun_light_intensity;
+
+for (uint i = 0; i < point_light_count; ++i) {
+	Light light = point_lights[i];
+
+	// “Распаковали” данные
+	vec3 light_position = light.position_radius.xyz;
+	float light_radius = light.position_radius.w;
+		
+	// ...код модели освещения по Блинн-Фонгу
+
+	color += light_shade * light_falloff * 
+             (f_color * light.color + light_spec);
+}
+
+Сделаем микс из прожекторов тоже
+for (uint i = 0; i < spot_light_count; ++i) {
+SpotLight light = spot_lights[i];
+
+	vec3 light_position = light.position_radius.xyz;
+	float light_radius = light.position_radius.w;
+
+	vec3 light_direction = light.direction_angle.xyz;
+	float light_angle = light.direction_angle.w;
+
+	vec3 spot_direction = normalize(light_position - f_position);
+	float spot_angle = -dot(light_direction, spot_direction);
+
+	if (spot_angle > light_angle) {
+		// Прибавляем код освещения по Блинн-Фонгу
+	}
+}
+
+Теперь всё светится!

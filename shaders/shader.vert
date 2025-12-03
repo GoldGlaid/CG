@@ -30,9 +30,6 @@ layout (binding = 1, std140) uniform ModelUniforms {
 void main() {
   vec4 position = material.model * vec4(v_position, 1.0f);
   
-  // Для нормалей используем обратную транспонированную матрицу модели
-  // Но для упрощения используем только верхнюю 3x3 часть модели (без масштабирования)
-  // Это работает правильно для большинства случаев
   mat3 normal_matrix = mat3(material.model);
   vec3 normal = normal_matrix * v_normal;
 

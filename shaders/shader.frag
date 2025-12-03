@@ -50,11 +50,11 @@ layout(std430, binding = 2) readonly buffer PointLightsBuffer {
 };
 
 void main() {
-  // ОТЛАДКА: Показываем только albedo цвет без освещения для проверки видимости объектов
+
   vec3 animated_albedo;
-  bool is_torus = (material.albedo_color.r > 1.5 && material.albedo_color.g > 1.5 && material.albedo_color.b > 1.5);
+  bool rainbow = (material.albedo_color.r > 1.5 && material.albedo_color.g > 1.5 && material.albedo_color.b > 1.5);
   
-  if (is_torus) {
+  if (rainbow) {
     // Для тора: анимация цвета через sin(time)
     float pi = 3.14159265359;
     float r = sin(scene.time) * 0.5 + 0.5;
@@ -86,10 +86,10 @@ void main() {
   vec3 sun_specular = material_specular * pow(max(0.0, dot(normal, half_vector)), material_shininess);
   vec3 sun_light_intensity = sun_shade * scene.sun_light_color * (sun_diffuse + sun_specular);
 
-  // Инициализируем итоговый цвет
+  // Итоговый цвет
   vec3 result = ambient + sun_light_intensity;
 
-  // Обрабатываем каждый точечный источник света
+  // Каждый точечный источник света
   if (scene.point_light_count > 0) {
     for (uint i = 0; i < scene.point_light_count && i < lights.length(); ++i) {
       PointLight light = lights[i];

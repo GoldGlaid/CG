@@ -175,6 +175,7 @@ inline namespace {
 
 	// Для настройки цвета кубика в прямом эфире
 	veekay::vec3 cube_color = {0.0f, 1.0f, 0.735f};
+	veekay::vec3 torus_color = {0.0f, 1.0f, 0.35f};
 
 	veekay::graphics::Texture* missing_texture;
 	VkSampler missing_texture_sampler;
@@ -310,6 +311,12 @@ veekay::mat4 Transform::matrix() const {
 	return t * r * s;
 }
 
+
+// [ r.x  u.x  -f.x  0 ]
+// [ r.y  u.y  -f.y  0 ]
+// [ r.z  u.z  -f.z  0 ]
+// [  0    0     0   1 ]
+
 veekay::mat4 Camera::look_at() const {
 
 	// forward - направление от камеры к target
@@ -322,25 +329,26 @@ veekay::mat4 Camera::look_at() const {
 	veekay::mat4 view_matrix{};
 
 	// В column-major формате: result[j][i] = столбец j, строка i
-	// Столбец 0: right вектор
+
+	// Столбец 0: right вектор (X ось камеры)
 	view_matrix[0][0] = r.x;
 	view_matrix[0][1] = r.y;
 	view_matrix[0][2] = r.z;
 	view_matrix[0][3] = 0.0f;
 
-	// Столбец 1: up вектор
+	// Столбец 1: up вектор (Y ось камеры)
 	view_matrix[1][0] = u.x;
 	view_matrix[1][1] = u.y;
 	view_matrix[1][2] = u.z;
 	view_matrix[1][3] = 0.0f;
 
-	// Столбец 2: -forward вектор (отрицательный, так как смотрим "назад")
+	// Столбец 2: -forward вектор т.к. смотрим назад (Z ось камеры)
 	view_matrix[2][0] = -f.x;
 	view_matrix[2][1] = -f.y;
 	view_matrix[2][2] = -f.z;
 	view_matrix[2][3] = 0.0f;
 
-	// Столбец 3: трансляция (отрицательная, так как это view matrix)
+	// Столбец 3: -трансляция т.к. это view matrix
 	view_matrix[3][0] = -veekay::vec3::dot(r, position);
 	view_matrix[3][1] = -veekay::vec3::dot(u, position);
 	view_matrix[3][2] = -veekay::vec3::dot(f, position);
@@ -405,7 +413,7 @@ void initialize(VkCommandBuffer cmd) {
 		orbit_pitch = 0.0f;
 	} else {
 		// Вычисляем углы из начальной позиции камеры
-		// Нормализуем offset для безопасности
+		// Нормализуем offset
 		veekay::vec3 normalized_offset = veekay::vec3::normalized(offset);
 		orbit_pitch = asinf(normalized_offset.y);
 		orbit_yaw = atan2f(normalized_offset.x, normalized_offset.z);
@@ -878,21 +886,6 @@ void initialize(VkCommandBuffer cmd) {
 
 	// NOTE: Add models to scene
 	models.clear();
-	//TODO: МОДЕЛЬКИ
-	// for (float i = 0.0; i < 10.0; i += 0.05f) {
-	// 	// Тор
-	// 	models.emplace_back(Model{
-	// 		.mesh = torus_mesh,
-	// 		.transform = Transform{
-	// 			.position = {-i, -9.0f + i , i},
-	// 			.scale = { i, i, i},
-	// 			.rotation = {-i, -9.0f + i , i},
-	// 		},
-	// 		.albedo_color = veekay::vec3{2.0f, 2.0f, 2.0f},  // Специальное значение для тора (будет анимироваться в шейдере)
-	// 		.specular_color = veekay::vec3{1.0f, 1.0f, 1.0f},
-	// 		.shininess = veekay::vec3{32.0f, 32.0f, 32.0f}
-	// 	});
-	// }
 
 	// Тор
 	models.emplace_back(Model{
@@ -902,11 +895,21 @@ void initialize(VkCommandBuffer cmd) {
 			.scale = {1.0f, 1.0f, 1.0f},
 			.rotation = {0.0f, 0.0f, 0.0f},
 		},
-		.albedo_color = veekay::vec3{2.0f, 2.0f, 2.0f},  // Специальное значение для тора (будет анимироваться в шейдере)
+		.albedo_color = torus_color,  // Специальное значение для тора (будет анимироваться в шейдере)
 		.specular_color = veekay::vec3{1.0f, 1.0f, 1.0f},
 		.shininess = veekay::vec3{32.0f, 32.0f, 32.0f}
 	});
 
+	// Куб
+	models.emplace_back(Model{
+		.mesh = cube_mesh,
+		.transform = Transform{
+			.position = {0.0f, -2.0f, 0.0f},
+		},
+		.albedo_color = cube_color,
+		.specular_color = veekay::vec3{0.8f, 0.8f, 0.8f},
+		.shininess = veekay::vec3{64.0f, 64.0f, 64.0f}
+	});
 
 	// Белая плоскость (Сетка куба)
 	models.emplace_back(Model{
@@ -920,16 +923,22 @@ void initialize(VkCommandBuffer cmd) {
 		.shininess = veekay::vec3{16.0f, 16.0f, 16.0f}
 	});
 
-	// Куб
-	models.emplace_back(Model{
-		.mesh = cube_mesh,
-		.transform = Transform{
-			.position = {0.0f, -2.0f, 0.0f},
-		},
-		.albedo_color = cube_color,
-		.specular_color = veekay::vec3{0.8f, 0.8f, 0.8f},
-		.shininess = veekay::vec3{64.0f, 64.0f, 64.0f}
-	});
+	// МОДЕЛЬКИ
+	for (float i = 0.0; i < 10.0; i += 0.05f) {
+		// Тор
+		float scale = i + 20;
+		models.emplace_back(Model{
+			.mesh = torus_mesh,
+			.transform = Transform{
+				.position = {-i, -9.0f + scale , scale},
+				.scale = { i, i, i},
+				.rotation = {-i, -9.0f + scale , scale},
+			},
+			.albedo_color = veekay::vec3{2.0f, 2.0f, 2.0f},  // Специальное значение для тора (будет анимироваться в шейдере)
+			.specular_color = veekay::vec3{1.0f, 1.0f, 1.0f},
+			.shininess = veekay::vec3{32.0f, 32.0f, 32.0f}
+		});
+	}
 
 	// Инициализация 3 точечных источников света по умолчанию
 	point_lights.clear();
@@ -992,9 +1001,10 @@ void updateCameraPosition() {
 	constexpr float max_pitch = float(M_PI) / 2.0f - 0.1f;   //  +90 градусов
 	orbit_pitch = std::max(min_pitch, std::min(max_pitch, orbit_pitch));
 	
-	// Сферические координаты: x = r * cos(pitch) * cos(yaw)
+	// Сферические координаты: x = r * cos(pitch) * cos(y	aw)
 	//                        y = r * sin(pitch)
 	//                        z = r * cos(pitch) * sin(yaw)
+
 	float cos_pitch = cosf(orbit_pitch);
 	camera.position.x = camera.target.x + orbit_radius * cosf(orbit_yaw) * cos_pitch;
 	camera.position.y = camera.target.y + orbit_radius * sinf(orbit_pitch);
@@ -1005,6 +1015,7 @@ void updateCameraPosition() {
 void update(double time) {
 	ImGui::Begin("Controls:");
 	ImGui::ColorEdit3("Cube Color", &cube_color.x);
+	ImGui::ColorEdit3("Torus Color", &torus_color.x);
 	
 	// Slider для FOV камеры
 
@@ -1067,7 +1078,7 @@ void update(double time) {
 	
 	ImGui::Separator();
 	ImGui::Text("Directional Light (Sun)");
-	ImGui::SliderFloat3("Direction", &sun_light_direction.x, -1.0f, 1.0f);
+	ImGui::SliderFloat3("Direction", &sun_light_direction.x, -40.0f, 40.0f);
 	ImGui::ColorEdit3("Sun Color", &sun_light_color.x);
 	
 	// Кнопка для сброса направления к значению по умолчанию
@@ -1077,18 +1088,22 @@ void update(double time) {
 	
 	ImGui::End();
 
-	// ДОП. ЗАДАНИЕ 2: Анимация вращения
+	// Анимация вращения
 	// Обновляем накопленное время анимации (если не на паузе)
 	if (!is_animation_paused) {
 		animation_time = time * rotation_speed * (is_rotation_reversed ? -1.0f : 1.0f);
 	}
 
-	//TODO: АНИМАЦИЯ
+	//АНИМАЦИЯ
 	if (!models.empty()) {
 		//тор
 		models[0].transform.rotation.y = animation_time;
 		//куб
-		models[2].transform.rotation.y = animation_time * -1.0f;
+		models[1].transform.rotation.y = animation_time * -1.0f;
+		for (int n = 3; n < models.size(); ++n) {
+			models[n].transform.rotation.y = animation_time;
+		}
+
 	}
 
 	if (!ImGui::IsWindowHovered()) {
@@ -1123,24 +1138,24 @@ void update(double time) {
 		}
 	}
 
-	// Камера должна обновляться каждый кадр, даже когда ввод заблокирован UI
+	// Камера обновляется каждый кадр
 	updateCameraPosition();
 
 	float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
 	
-	// Обновляем shader-storage буфер с данными точечных источников
+	// Обновление shader-storage буфера с данными точечных источников
 	uint32_t active_light_count = static_cast<uint32_t>(point_lights.size());
 	if (active_light_count > max_point_lights) {
 		active_light_count = max_point_lights;
 	}
 	
-	// Копируем данные источников в буфер
+	// Копирование данных источников в буфер
 	PointLight* lights_buffer = static_cast<PointLight*>(point_lights_buffer->mapped_region);
 	for (size_t i = 0; i < active_light_count; ++i) {
 		lights_buffer[i] = point_lights[i];
 	}
 	
-	// Добавить время в uniform
+	// Добавление времени в uniform
 	SceneUniforms scene_uniforms{
 		.view_projection = camera.view_projection(aspect_ratio),
 		.view_position = camera.position,
@@ -1152,7 +1167,7 @@ void update(double time) {
 		.sun_light_color = sun_light_color,
 		._pad3 = 0.0f,
 		.point_light_count = active_light_count,
-		.time = static_cast<float>(time)  // Передаем время для анимации цвета
+		.time = static_cast<float>(time)  // Передача времени для анимации цвета
 	};
 
 	std::vector<ModelUniforms> model_uniforms(models.size());
@@ -1161,14 +1176,16 @@ void update(double time) {
 		ModelUniforms& uniforms = model_uniforms[i];
 
 		uniforms.model = model.transform.matrix();
-		// Обновляем цвет куба из переменной cube_color (которая изменяется через UI)
-		if (i == 2) { // Индекс 2 - это куб (тор=0, плоскость=1, куб=2)
+		// Обновление цвета куба
+		if (i == 1) {
 			uniforms.albedo_color = cube_color;
+		} else if (i == 0) {
+			uniforms.albedo_color = torus_color;
 		} else {
 			uniforms.albedo_color = model.albedo_color;
 		}
 		
-		// Передаем материалы
+		// Передача материалов
 		uniforms.specular_color = model.specular_color;
 		uniforms.shininess = model.shininess.x;  // Используем x компонент как shininess
 	}
