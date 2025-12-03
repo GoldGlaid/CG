@@ -3,7 +3,7 @@ include(FetchContent)
 
 project(testbed LANGUAGES C CXX)
 
-add_executable(${PROJECT_NAME} lab2.cpp)
+add_executable(${PROJECT_NAME} lab3.cpp)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD_REQUIRED TRUE CXX_STANDARD 20)
 
@@ -59,3 +59,7 @@ endif()
 add_custom_command(TARGET testbed POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_directory
 		${CMAKE_SOURCE_DIR}/shaders $<TARGET_FILE_DIR:testbed>/shaders)
+
+add_custom_command(TARGET testbed POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_directory
+		${CMAKE_SOURCE_DIR}/testbed/images $<TARGET_FILE_DIR:testbed>/images)

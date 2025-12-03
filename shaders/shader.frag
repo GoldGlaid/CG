@@ -1,10 +1,4 @@
 #version 450
-// ============================================================================
-// FRAGMENT SHADER с моделью Блинн-Фонга для точечных источников света
-// ОСНОВНОЕ ЗАДАНИЕ: Анимация цвета через sin(time) для RGB компонент (сохранена)
-// Доп. задание: используется time из SceneUniforms для расчета цвета
-// ============================================================================
-
 layout (location = 0) in vec3 f_position;
 layout (location = 1) in vec3 f_normal;
 layout (location = 2) in vec2 f_uv;
@@ -32,8 +26,9 @@ layout (binding = 0, std140) uniform SceneUniforms {
 layout (binding = 1, std140) uniform ModelUniforms {
   mat4 model;
   vec3 albedo_color;
-  float _pad0;
+  float disable_uv_distortion;  // 0.0 = применять искажение UV, 1.0 = не применять
   vec3 specular_color;
+  float enable_color_tinting;  // 1.0 = применять цвет к текстуре, 0.0 = не применять
   float shininess;
 } material;
 
@@ -49,25 +44,52 @@ layout(std430, binding = 2) readonly buffer PointLightsBuffer {
   PointLight lights[];
 };
 
-void main() {
+// Текстуры материалов
+layout (binding = 3) uniform sampler2D albedo_texture;
+layout (binding = 4) uniform sampler2D specular_texture;
+layout (binding = 5) uniform sampler2D emissive_texture;
 
-  vec3 animated_albedo;
-  bool rainbow = (material.albedo_color.r > 1.5 && material.albedo_color.g > 1.5 && material.albedo_color.b > 1.5);
+void main() {
+  // Нетривиальное сэмплирование: модифицируем UV координаты
+  // Добавляем волновое искажение на основе позиции и времени (только если не отключено)
+  vec2 modified_uv = f_uv;
   
-  if (rainbow) {
-    // Для тора: анимация цвета через sin(time)
-    float pi = 3.14159265359;
-    float r = sin(scene.time) * 0.5 + 0.5;
-    float g = sin(scene.time + 2.0 * pi / 3.0) * 0.5 + 0.5;
-    float b = sin(scene.time + 4.0 * pi / 3.0) * 0.5 + 0.5;
-    animated_albedo = vec3(r, g, b);
-  } else {
-    animated_albedo = clamp(material.albedo_color, 0.0, 1.0);
+  if (material.disable_uv_distortion < 0.5) {
+    // Волновое искажение: синусоидальная деформация (слабое для видимости текстуры)
+    float wave_strength = 0.02;  // Сила искажения (уменьшено)
+    float wave_frequency = 2.0;  // Частота волн
+    modified_uv.x += sin(f_uv.y * wave_frequency + scene.time * 1.0) * wave_strength;
+    modified_uv.y += cos(f_uv.x * wave_frequency + scene.time * 1.0) * wave_strength;
+    
+    // Дополнительно: слабое вращение UV координат на основе позиции
+    float angle = length(f_position.xy) * 0.05 + scene.time * 0.2;
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+    vec2 centered_uv = modified_uv - vec2(0.5, 0.5);
+    modified_uv = vec2(
+      centered_uv.x * cos_a - centered_uv.y * sin_a,
+      centered_uv.x * sin_a + centered_uv.y * cos_a
+    ) + vec2(0.5, 0.5);
+    
+    // Ограничиваем UV координаты, чтобы не выходить за пределы текстуры
+    modified_uv = clamp(modified_uv, vec2(0.0), vec2(1.0));
   }
 
-  // Материал
-  vec3 material_albedo = animated_albedo;
-  vec3 material_specular = material.specular_color;
+  // Сэмплируем текстуры
+  vec4 albedo_tex = texture(albedo_texture, modified_uv);
+  vec4 specular_tex = texture(specular_texture, modified_uv);
+  vec4 emissive_tex = texture(emissive_texture, modified_uv);
+
+  // Используем цвет материала для тонирования (только если включено)
+  vec3 material_albedo;
+  if (material.enable_color_tinting > 0.5) {
+    material_albedo = albedo_tex.rgb * material.albedo_color;  // С тонированием
+  } else {
+    material_albedo = albedo_tex.rgb;  // Без тонирования
+  }
+
+  // Используем specular текстуру для модуляции specular цвета
+  vec3 material_specular = material.specular_color * specular_tex.rgb;
   float material_shininess = material.shininess;
 
   // Нормализуем нормаль
@@ -114,6 +136,17 @@ void main() {
       // Суммируем вклад источника света
       result += (diffuse + specular) * attenuation;
     }
+  }
+
+  // Добавляем emissive вклад (не зависит от освещения)
+  vec3 emissive = emissive_tex.rgb;
+  result += emissive;
+
+
+  if (material.disable_uv_distortion >= 0.5 && material.enable_color_tinting < 0.5 && 
+      material.shininess < 0.5 && 
+      material.specular_color.r < 0.1 && material.specular_color.g < 0.1 && material.specular_color.b < 0.1) {
+    result = material_albedo;
   }
 
   final_color = vec4(result, 1.0f);
