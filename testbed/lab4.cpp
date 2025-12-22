@@ -37,6 +37,7 @@ struct PointLight {
 
 struct SceneUniforms {
 	veekay::mat4 view_projection;
+		veekay::mat4 shadow_projection;  // Матрица проекции теней для направленного света (должна быть сразу после view_projection!)
 	veekay::vec3 view_position;  // Позиция камеры для расчета view direction
 	float _pad0;  // Выравнивание для std140
 	
@@ -51,6 +52,10 @@ struct SceneUniforms {
 	
 	uint32_t point_light_count;  // Количество активных точечных источников
 	float time;  // Для анимации цвета через sin(time)
+	
+	uint32_t active_shadow_sources;  // Битовая маска активных источников теней
+	float shadow_bias;  // Смещение для расчета теней
+	float _pad4;  // Выравнивание для std140
 };
 
 struct ModelUniforms {
@@ -130,7 +135,7 @@ struct Camera {
 	veekay::mat4 view_projection(float aspect_ratio) const;
 
 	// NOTE: Look-At matrix calculation
-	veekay::mat4 look_at() const;
+	veekay::mat4 look_at(const veekay::vec3 at) const;
 };
 
 // NOTE: Scene objects
@@ -203,12 +208,35 @@ inline namespace {
 	uint32_t aligned_model_uniforms_size;
 
 	Mesh torus_mesh;  // Тор
+	Mesh sphere_mesh;  // Сфера
 	
 	veekay::graphics::Buffer* point_lights_buffer;  // Shader-storage буфер для точечных источников
 	
 	Mesh skybox_mesh;  // Skybox (общий mesh для всех граней)
 	Mesh skybox_faces[6];  // Отдельные меши для каждой грани skybox
 	uint32_t skybox_model_indices[6] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};  // Индексы моделей skybox
+	
+	// Shadow mapping
+	constexpr uint32_t shadow_map_size = 4096;
+	
+	// Dynamic Rendering function pointers
+	PFN_vkCmdBeginRendering vkCmdBeginRenderingKHR = nullptr;
+	PFN_vkCmdEndRendering vkCmdEndRenderingKHR = nullptr;
+	struct {
+		VkFormat depth_image_format;
+		VkImage depth_image;
+		VkDeviceMemory depth_image_memory;
+		VkImageView depth_image_view;
+		VkShaderModule vertex_shader;
+		VkDescriptorSetLayout descriptor_set_layout;
+		VkDescriptorSet descriptor_set;
+		VkPipelineLayout pipeline_layout;
+		VkPipeline pipeline;
+		veekay::graphics::Buffer* uniform_buffer;
+		VkSampler sampler;
+		veekay::mat4 matrix;
+		VkImageLayout current_layout;  // Track current image layout
+	} shadow = {};  // Initialize to zero
 }
 
 float toRadians(float degrees) {
@@ -385,6 +413,70 @@ Mesh generateTorusMesh(float majorRadius, float minorRadius,
 	return mesh;
 }
 
+Mesh generateSphereMesh(float radius, uint32_t segments) {
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
+	
+	// Генерация вершин сферы
+	for (uint32_t i = 0; i <= segments; ++i) {
+		float theta = float(i) / float(segments) * float(M_PI);  // От 0 до π (вертикальный угол)
+		float sin_theta = sinf(theta);
+		float cos_theta = cosf(theta);
+		
+		for (uint32_t j = 0; j <= segments; ++j) {
+			float phi = float(j) / float(segments) * 2.0f * float(M_PI);  // От 0 до 2π (горизонтальный угол)
+			float sin_phi = sinf(phi);
+			float cos_phi = cosf(phi);
+			
+			// Параметрические уравнения сферы
+			float x = radius * sin_theta * cos_phi;
+			float y = radius * cos_theta;
+			float z = radius * sin_theta * sin_phi;
+			
+			veekay::vec3 position{x, y, z};
+			
+			// Нормаль для сферы - это нормализованный вектор от центра к точке
+			veekay::vec3 normal = veekay::vec3::normalized(position);
+			
+			// UV координаты
+			veekay::vec2 uv{float(j) / float(segments), float(i) / float(segments)};
+			
+			vertices.push_back(Vertex{position, normal, uv});
+		}
+	}
+	
+	// Генерация индексов для треугольников
+	for (uint32_t i = 0; i < segments; ++i) {
+		for (uint32_t j = 0; j < segments; ++j) {
+			uint32_t current = i * (segments + 1) + j;
+			uint32_t next = current + segments + 1;
+			
+			// Первый треугольник (против часовой стрелки для правильных нормалей)
+			indices.push_back(current);
+			indices.push_back(next);
+			indices.push_back(current + 1);
+			
+			// Второй треугольник (против часовой стрелки для правильных нормалей)
+			indices.push_back(current + 1);
+			indices.push_back(next);
+			indices.push_back(next + 1);
+		}
+	}
+	
+	Mesh mesh;
+	mesh.vertex_buffer = new veekay::graphics::Buffer(
+		vertices.size() * sizeof(Vertex), vertices.data(),
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+	
+	mesh.index_buffer = new veekay::graphics::Buffer(
+		indices.size() * sizeof(uint32_t), indices.data(),
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+	
+	mesh.indices = uint32_t(indices.size());
+	
+	return mesh;
+}
+
 veekay::mat4 Transform::matrix() const {
 	// Полная матрица преобразования (scaling + rotation + translation)
 	
@@ -409,54 +501,67 @@ veekay::mat4 Transform::matrix() const {
 // [ r.z  u.z  -f.z  0 ]
 // [  0    0     0   1 ]
 
-veekay::mat4 Camera::look_at() const {
+veekay::mat4 Camera::look_at(const veekay::vec3 at) const {
+  const veekay::vec3 forward = veekay::vec3::normalized(position - at);
+  constexpr veekay::vec3 world_up = {0, 1, 0};
+  const veekay::vec3 right =
+      veekay::vec3::normalized(veekay::vec3::cross(forward, world_up));
+  const veekay::vec3 up =
+      veekay::vec3::normalized(veekay::vec3::cross(right, forward));
 
-	// forward - направление от камеры к target
-	veekay::vec3 f = veekay::vec3::normalized(target - position);
-	// right - перпендикуляр к forward и world up
-	veekay::vec3 r = veekay::vec3::normalized(veekay::vec3::cross(f, up));
-	// up - пересчитанный up вектор (перпендикуляр к right и forward)
-	veekay::vec3 u = veekay::vec3::cross(r, f);
+  const veekay::mat4 basis = {
+      right.x, up.x, -forward.x, 0, right.y, up.y, -forward.y, 0,
+      right.z, up.z, -forward.z, 0, 0,       0,    0,          1};
 
-	veekay::mat4 view_matrix{};
-
-	// В column-major формате: result[j][i] = столбец j, строка i
-
-	// Столбец 0: right вектор (X ось камеры)
-	view_matrix[0][0] = r.x;
-	view_matrix[0][1] = r.y;
-	view_matrix[0][2] = r.z;
-	view_matrix[0][3] = 0.0f;
-
-	// Столбец 1: up вектор (Y ось камеры)
-	view_matrix[1][0] = u.x;
-	view_matrix[1][1] = u.y;
-	view_matrix[1][2] = u.z;
-	view_matrix[1][3] = 0.0f;
-
-	// Столбец 2: -forward вектор т.к. смотрим назад (Z ось камеры)
-	view_matrix[2][0] = -f.x;
-	view_matrix[2][1] = -f.y;
-	view_matrix[2][2] = -f.z;
-	view_matrix[2][3] = 0.0f;
-
-	// Столбец 3: -трансляция т.к. это view matrix
-	view_matrix[3][0] = -veekay::vec3::dot(r, position);
-	view_matrix[3][1] = -veekay::vec3::dot(u, position);
-	view_matrix[3][2] = -veekay::vec3::dot(f, position);
-	view_matrix[3][3] = 1.0f;
-
-	return view_matrix;
+  return veekay::mat4::translation(-position) * basis;
 }
 
 veekay::mat4 Camera::view() const {
-	return look_at();
+	return look_at({0, 0, 0});
 }
 
 veekay::mat4 Camera::view_projection(float aspect_ratio) const {
 	auto proj = veekay::mat4::projection(fov, aspect_ratio, near_plane, far_plane);
 
 	return view() * proj;
+}
+
+// Orthographic projection function for shadow mapping
+veekay::mat4 orthographic_projection(float size, float aspect_ratio, float near_plane, float far_plane) {
+	veekay::mat4 result{};
+	
+	float height = size;
+	float width = height * aspect_ratio;
+	
+	float l = -width;   // left
+	float r = width;     // right
+	float b = -height;   // bottom
+	float t = height;    // top
+	float n = near_plane; // near
+	float f = far_plane;  // far
+	
+	// Orthographic projection matrix for Vulkan (Z in [0, 1])
+	result[0][0] = 2.0f / (r - l);
+	result[0][1] = 0.0f;
+	result[0][2] = 0.0f;
+	result[0][3] = 0.0f;
+	
+	result[1][0] = 0.0f;
+	result[1][1] = 2.0f / (t - b);
+	result[1][2] = 0.0f;
+	result[1][3] = 0.0f;
+	
+	result[2][0] = 0.0f;
+	result[2][1] = 0.0f;
+	result[2][2] = 1.0f / (f - n);  // For Z in [0, 1]
+	result[2][3] = 0.0f;
+	
+	result[3][0] = -(r + l) / (r - l);
+	result[3][1] = -(t + b) / (t - b);
+	result[3][2] = -n / (f - n);  // Offset for Vulkan
+	result[3][3] = 1.0f;
+	
+	return result;
 }
 
 // NOTE: Loads shader byte code from file
@@ -679,7 +784,7 @@ void initialize(VkCommandBuffer cmd) {
 				},
 				{
 					.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-					.descriptorCount = 96,  // 32 материалов * 3 текстуры (albedo, specular, emissive)
+					.descriptorCount = 128,  // 32 материалов * 3 текстуры + shadow texture для всех
 				}
 			};
 			
@@ -739,6 +844,13 @@ void initialize(VkCommandBuffer cmd) {
 				//emissive texture - текстура свечения
 				{
 					.binding = 5,
+					.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				//shadow texture - текстура теней
+				{
+					.binding = 6,
 					.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 					.descriptorCount = 1,
 					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1202,6 +1314,22 @@ void initialize(VkCommandBuffer cmd) {
 			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		};
 
+		// Shadow texture will be updated after shadow resources are created
+		// Skip shadow texture binding if resources not ready (will be updated later)
+		bool shadow_ready = shadow.depth_image_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE;
+		
+		VkDescriptorImageInfo shadow_image_info{};
+		if (shadow_ready) {
+			shadow_image_info = {
+				.sampler = shadow.sampler,
+				.imageView = shadow.depth_image_view,
+				.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
+		}
+
+		// Only update shadow texture binding if shadow resources are ready
+		size_t write_count = shadow_ready ? 7 : 6; // With or without shadow texture
+
 		VkWriteDescriptorSet write_infos[] = {
 			{
 				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1255,12 +1383,25 @@ void initialize(VkCommandBuffer cmd) {
 				.dstArrayElement = 0,
 				.descriptorCount = 1,
 				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.pImageInfo = &emissive_image_info,
-		},
-	};
+				.pImageInfo = &emissive_image_info,
+			},
+		};
 
-	vkUpdateDescriptorSets(device, sizeof(write_infos) / sizeof(write_infos[0]),
-	                       write_infos, 0, nullptr);
+		// Add shadow texture binding only if ready
+		if (shadow_ready) {
+			VkWriteDescriptorSet shadow_write{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = material_descriptor_sets[i],
+				.dstBinding = 6,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.pImageInfo = &shadow_image_info,
+			};
+			write_infos[6] = shadow_write;
+		}
+
+		vkUpdateDescriptorSets(device, write_count, write_infos, 0, nullptr);
 	}
 
 {
@@ -1281,6 +1422,22 @@ void initialize(VkCommandBuffer cmd) {
 				.range = max_point_lights * sizeof(PointLight),
 			},
 		};
+
+		// Shadow texture will be updated after shadow resources are created
+		// Skip shadow texture binding if resources not ready (will be updated later)
+		bool shadow_ready = shadow.depth_image_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE;
+		
+		VkDescriptorImageInfo shadow_image_info{};
+		if (shadow_ready) {
+			shadow_image_info = {
+				.sampler = shadow.sampler,
+				.imageView = shadow.depth_image_view,
+				.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
+		}
+
+		// Only update shadow texture binding if shadow resources are ready
+		size_t write_count = shadow_ready ? 4 : 3; // With or without shadow texture
 
 		VkWriteDescriptorSet write_infos[] = {
 			{
@@ -1312,9 +1469,25 @@ void initialize(VkCommandBuffer cmd) {
 			},
 		};
 
-		vkUpdateDescriptorSets(device, sizeof(write_infos) / sizeof(write_infos[0]),
-		                       write_infos, 0, nullptr);
+		// Add shadow texture binding only if ready
+		if (shadow_ready) {
+			VkWriteDescriptorSet shadow_write{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = descriptor_set,
+				.dstBinding = 6,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.pImageInfo = &shadow_image_info,
+			};
+			write_infos[3] = shadow_write;
+		}
+
+		vkUpdateDescriptorSets(device, write_count, write_infos, 0, nullptr);
 	}
+
+	// Note: Material descriptor sets with shadow texture are updated after shadow sampler is created
+	// (see code after shadow sampler creation in initialize())
 
 	// NOTE: Plane mesh initialization
 	{
@@ -1400,47 +1573,47 @@ void initialize(VkCommandBuffer cmd) {
 	}
 
 	torus_mesh = generateTorusMesh(1.5f, 0.5f, 12, 16);
+	sphere_mesh = generateSphereMesh(1.0f, 32);  // Радиус 1.0, 32 сегмента
 
 	{
-		// Для skybox грани должны быть обращены ВНУТРЬ куба (камера внутри)
-		// Используем стандартный порядок вершин, но инвертируем нормали
 		std::vector<Vertex> vertices = {
-			// Front face (Z+) - pz.png, используем полный диапазон UV (0-1)
-			{{-1.0f, -1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},   // нижний левый
-			{{+1.0f, -1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},   // нижний правый
-			{{+1.0f, +1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f}},   // верхний правый
-			{{-1.0f, +1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f}},   // верхний левый
-			
-			// Back face (Z-) - nz.png, используем полный диапазон UV (0-1)
-			{{+1.0f, -1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, 1.0f}},  // нижний левый (в мировых координатах)
-			{{-1.0f, -1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {1.0f, 1.0f}},  // нижний правый
-			{{-1.0f, +1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {1.0f, 0.0f}},  // верхний правый
-			{{+1.0f, +1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, 0.0f}},  // верхний левый
-			
-			// Right face (X+) - px.png, используем полный диапазон UV (0-1)
-			{{+1.0f, -1.0f, +1.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f}},   // нижний левый
-			{{+1.0f, -1.0f, -1.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 1.0f}},   // нижний правый
-			{{+1.0f, +1.0f, -1.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},   // верхний правый
-			{{+1.0f, +1.0f, +1.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},   // верхний левый
-			
-			// Left face (X-) - nx.png, используем полный диапазон UV (0-1)
-			{{-1.0f, -1.0f, -1.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f}},  // нижний левый
-			{{-1.0f, -1.0f, +1.0f}, {-1.0f, 0.0f, 0.0f}, {1.0f, 1.0f}},  // нижний правый
-			{{-1.0f, +1.0f, +1.0f}, {-1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},  // верхний правый
-			{{-1.0f, +1.0f, -1.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // верхний левый
-			
-			// Bottom face (Y-) - ny.png, используем полный диапазон UV (0-1)
-			{{-1.0f, -1.0f, -1.0f}, {0.0f, -1.0f, 0.0f}, {0.0f, 1.0f}}, // нижний левый
-			{{+1.0f, -1.0f, -1.0f}, {0.0f, -1.0f, 0.0f}, {1.0f, 1.0f}}, // нижний правый
-			{{+1.0f, -1.0f, +1.0f}, {0.0f, -1.0f, 0.0f}, {1.0f, 0.0f}},  // верхний правый
-			{{-1.0f, -1.0f, +1.0f}, {0.0f, -1.0f, 0.0f}, {0.0f, 0.0f}},  // верхний левый
-			
-			// Top face (Y+) - py.png, используем полный диапазон UV (0-1)
-			{{-1.0f, +1.0f, +1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},   // нижний левый
-			{{+1.0f, +1.0f, +1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},   // нижний правый
-			{{+1.0f, +1.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},   // верхний правый
-			{{-1.0f, +1.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},  // верхний левый
-		};
+	    // Front face (Z+) - pz.png
+	    {{-1.0f, -1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f}},   // нижний левый
+	    {{+1.0f, -1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 0.0f}},   // нижний правый
+	    {{+1.0f, +1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},   // верхний правый
+	    {{-1.0f, +1.0f, +1.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},   // верхний левый
+
+	    // Back face (Z-) - nz.png
+	    {{+1.0f, -1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, 0.0f}},  // нижний левый
+	    {{-1.0f, -1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {1.0f, 0.0f}},  // нижний правый
+	    {{-1.0f, +1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {1.0f, 1.0f}},  // верхний правый
+	    {{+1.0f, +1.0f, -1.0f}, {0.0f, 0.0f, -1.0f}, {0.0f, 1.0f}},  // верхний левый
+
+	    // Right face (X+) - px.png
+	    {{+1.0f, -1.0f, +1.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},   // нижний левый
+	    {{+1.0f, -1.0f, -1.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},   // нижний правый
+	    {{+1.0f, +1.0f, -1.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 1.0f}},   // верхний правый
+	    {{+1.0f, +1.0f, +1.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f}},   // верхний левый
+
+	    // Left face (X-) - nx.png
+	    {{-1.0f, -1.0f, -1.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},  // нижний левый
+	    {{-1.0f, -1.0f, +1.0f}, {-1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},  // нижний правый
+	    {{-1.0f, +1.0f, +1.0f}, {-1.0f, 0.0f, 0.0f}, {1.0f, 1.0f}},  // верхний правый
+	    {{-1.0f, +1.0f, -1.0f}, {-1.0f, 0.0f, 0.0f}, {0.0f, 1.0f}}, // верхний левый
+
+	    // Top face (Y+) - py.png
+	    {{-1.0f, +1.0f, +1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},   // нижний левый
+	    {{+1.0f, +1.0f, +1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},   // нижний правый
+	    {{+1.0f, +1.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},   // верхний правый
+	    {{-1.0f, +1.0f, -1.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 1.0f}},  // верхний левый
+
+	    // Bottom face (Y-) - ny.png
+	    {{-1.0f, -1.0f, -1.0f}, {0.0f, -1.0f, 0.0f}, {0.0f, 0.0f}}, // нижний левый
+	    {{+1.0f, -1.0f, -1.0f}, {0.0f, -1.0f, 0.0f}, {1.0f, 0.0f}}, // нижний правый
+	    {{+1.0f, -1.0f, +1.0f}, {0.0f, -1.0f, 0.0f}, {1.0f, 1.0f}},  // верхний правый
+	    {{-1.0f, -1.0f, +1.0f}, {0.0f, -1.0f, 0.0f}, {0.0f, 1.0f}},  // верхний левый
+	};
+
 
 		std::vector<uint32_t> indices = {
 			// Front
@@ -1636,6 +1809,33 @@ void initialize(VkCommandBuffer cmd) {
 		});
 	}
 
+	// Две сферы с текстурой gold
+	models.emplace_back(Model{
+		.mesh = sphere_mesh,
+		.transform = Transform{
+			.position = {1.0f, -3.0f, 0.0f},
+			.scale = {20.0f, 20.0f, 20.0f},
+			.rotation = {0.0f, 0.0f, 0.0f},
+		},
+		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f},  // Белый цвет для текстуры
+		.specular_color = veekay::vec3{1.0f, 1.0f, 1.0f},
+		.shininess = veekay::vec3{32.0f, 32.0f, 32.0f},
+		.material_index = 0  // Материал с gold_texture
+	});
+
+	models.emplace_back(Model{
+		.mesh = sphere_mesh,
+		.transform = Transform{
+			.position = {-1.0f, -3.0f, 0.0f},
+			.scale = {20.0f, 20.0f, 20.0f},
+			.rotation = {0.0f, 0.0f, 0.0f},
+		},
+		.albedo_color = veekay::vec3{1.0f, 1.0f, 1.0f},  // Белый цвет для текстуры
+		.specular_color = veekay::vec3{1.0f, 1.0f, 1.0f},
+		.shininess = veekay::vec3{32.0f, 32.0f, 32.0f},
+		.material_index = 0  // Материал с gold_texture
+	});
+
 	// Добавляем skybox (6 граней)
 	// Для look-at камеры skybox должен быть в (0,0,0), так как view matrix уже компенсирует translation
 	// Материалы: 5=px, 6=nx, 7=py, 8=ny, 9=pz, 10=nz
@@ -1733,6 +1933,462 @@ void initialize(VkCommandBuffer cmd) {
 		._pad0 = 0.0f
 	});
 
+	// ============================================================
+	// Shadow mapping initialization
+	// ============================================================
+	{
+		// Select optimal depth format
+		VkFormat candidates[] = {
+			VK_FORMAT_D32_SFLOAT,
+			VK_FORMAT_D32_SFLOAT_S8_UINT,
+			VK_FORMAT_D24_UNORM_S8_UINT,
+			VK_FORMAT_D16_UNORM,
+		};
+
+		shadow.depth_image_format = VK_FORMAT_UNDEFINED;
+
+		for (const auto& f : candidates) {
+			VkFormatProperties properties;
+			vkGetPhysicalDeviceFormatProperties(physical_device, f, &properties);
+
+			if (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT &&
+			    properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+				shadow.depth_image_format = f;
+				break;
+			}
+		}
+
+		if (shadow.depth_image_format == VK_FORMAT_UNDEFINED) {
+			std::cerr << "Failed to find suitable depth format for shadow map\n";
+			veekay::app.running = false;
+			return;
+		}
+		
+		// Debug: выводим выбранный формат
+		std::cout << "Shadow map format: ";
+		if (shadow.depth_image_format == VK_FORMAT_D32_SFLOAT) {
+			std::cout << "D32_SFLOAT\n";
+		} else if (shadow.depth_image_format == VK_FORMAT_D24_UNORM_S8_UINT) {
+			std::cout << "D24_UNORM_S8_UINT\n";
+		} else if (shadow.depth_image_format == VK_FORMAT_D16_UNORM) {
+			std::cout << "D16_UNORM\n";
+		} else if (shadow.depth_image_format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+			std::cout << "D32_SFLOAT_S8_UINT\n";
+		} else {
+			std::cout << "Unknown format\n";
+		}
+
+		// Create depth image
+		VkImageCreateInfo image_info{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+			.imageType = VK_IMAGE_TYPE_2D,
+			.format = shadow.depth_image_format,
+			.extent = {shadow_map_size, shadow_map_size, 1},
+			.mipLevels = 1,
+			.arrayLayers = 1,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.tiling = VK_IMAGE_TILING_OPTIMAL,
+			.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		};
+
+		if (vkCreateImage(device, &image_info, nullptr, &shadow.depth_image) != VK_SUCCESS) {
+			std::cerr << "Failed to create shadow depth image\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		// Allocate memory
+		VkMemoryRequirements mem_requirements;
+		vkGetImageMemoryRequirements(device, shadow.depth_image, &mem_requirements);
+
+		VkPhysicalDeviceMemoryProperties mem_properties;
+		vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
+
+		uint32_t memory_type_index = UINT32_MAX;
+		for (uint32_t i = 0; i < mem_properties.memoryTypeCount; ++i) {
+			if ((mem_requirements.memoryTypeBits & (1 << i)) &&
+			    (mem_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+				memory_type_index = i;
+				break;
+			}
+		}
+
+		if (memory_type_index == UINT32_MAX) {
+			std::cerr << "Failed to find suitable memory type for shadow depth image\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		VkMemoryAllocateInfo alloc_info{
+			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+			.allocationSize = mem_requirements.size,
+			.memoryTypeIndex = memory_type_index,
+		};
+
+		if (vkAllocateMemory(device, &alloc_info, nullptr, &shadow.depth_image_memory) != VK_SUCCESS) {
+			std::cerr << "Failed to allocate memory for shadow depth image\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		if (vkBindImageMemory(device, shadow.depth_image, shadow.depth_image_memory, 0) != VK_SUCCESS) {
+			std::cerr << "Failed to bind memory to shadow depth image\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		// Create image view
+		VkImageViewCreateInfo view_info{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image = shadow.depth_image,
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format = shadow.depth_image_format,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		};
+
+		if (vkCreateImageView(device, &view_info, nullptr, &shadow.depth_image_view) != VK_SUCCESS) {
+			std::cerr << "Failed to create shadow depth image view\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		// Initialize layout tracking
+		shadow.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
+
+	// Create shadow pipeline
+	{
+		// Load shadow vertex shader
+		shadow.vertex_shader = loadShaderModule("./shaders/shadow.vert.spv");
+		if (!shadow.vertex_shader) {
+			std::cerr << "Failed to load shadow vertex shader\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		VkPipelineShaderStageCreateInfo stage_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			.stage = VK_SHADER_STAGE_VERTEX_BIT,
+			.module = shadow.vertex_shader,
+			.pName = "main",
+		};
+
+		// Vertex input - only position
+		VkVertexInputBindingDescription buffer_binding{
+			.binding = 0,
+			.stride = sizeof(Vertex),
+			.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+		};
+
+		VkVertexInputAttributeDescription attributes[] = {
+			{
+				.location = 0,
+				.binding = 0,
+				.format = VK_FORMAT_R32G32B32_SFLOAT,
+				.offset = offsetof(Vertex, position),
+			},
+		};
+
+		VkPipelineVertexInputStateCreateInfo input_state_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+			.vertexBindingDescriptionCount = 1,
+			.pVertexBindingDescriptions = &buffer_binding,
+			.vertexAttributeDescriptionCount = sizeof(attributes) / sizeof(attributes[0]),
+			.pVertexAttributeDescriptions = attributes,
+		};
+
+		VkPipelineInputAssemblyStateCreateInfo assembly_state_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+			.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		};
+
+		VkPipelineRasterizationStateCreateInfo raster_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+			.polygonMode = VK_POLYGON_MODE_FILL,
+			.cullMode = VK_CULL_MODE_FRONT_BIT,  // Front-face culling
+			.frontFace = VK_FRONT_FACE_CLOCKWISE,
+			.depthBiasEnable = true,
+			.lineWidth = 1.0f,
+		};
+
+		VkPipelineMultisampleStateCreateInfo sample_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+			.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+			.sampleShadingEnable = false,
+			.minSampleShading = 1.0f,
+		};
+
+		VkViewport shadow_viewport{
+			.x = 0.0f,
+			.y = 0.0f,
+			.width = static_cast<float>(shadow_map_size),
+			.height = static_cast<float>(shadow_map_size),
+			.minDepth = 0.0f,
+			.maxDepth = 1.0f,
+		};
+
+		VkRect2D shadow_scissor{
+			.offset = {0, 0},
+			.extent = {shadow_map_size, shadow_map_size},
+		};
+
+		VkPipelineViewportStateCreateInfo shadow_viewport_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+			.viewportCount = 1,
+			.pViewports = &shadow_viewport,
+			.scissorCount = 1,
+			.pScissors = &shadow_scissor,
+		};
+
+		VkPipelineDepthStencilStateCreateInfo depth_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+			.depthTestEnable = true,
+			.depthWriteEnable = true,
+			.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+		};
+
+		VkPipelineColorBlendStateCreateInfo blend_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		};
+
+		VkDynamicState dyn_states[] = {
+			VK_DYNAMIC_STATE_VIEWPORT,
+			VK_DYNAMIC_STATE_SCISSOR,
+			VK_DYNAMIC_STATE_DEPTH_BIAS,
+		};
+
+		VkPipelineDynamicStateCreateInfo dyn_state_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+			.dynamicStateCount = sizeof(dyn_states) / sizeof(dyn_states[0]),
+			.pDynamicStates = dyn_states,
+		};
+
+		VkPipelineRenderingCreateInfo format_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+			.depthAttachmentFormat = shadow.depth_image_format,
+		};
+
+		// Create descriptor set layout
+		VkDescriptorSetLayoutBinding bindings[] = {
+			{
+				.binding = 0,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+			},
+			{
+				.binding = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+			},
+		};
+
+		VkDescriptorSetLayoutCreateInfo layout_info{
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+			.bindingCount = sizeof(bindings) / sizeof(bindings[0]),
+			.pBindings = bindings,
+		};
+
+		if (vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &shadow.descriptor_set_layout) != VK_SUCCESS) {
+			std::cerr << "Failed to create shadow descriptor set layout\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		// Allocate descriptor set
+		VkDescriptorSetAllocateInfo alloc_info{
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			.descriptorPool = descriptor_pool,
+			.descriptorSetCount = 1,
+			.pSetLayouts = &shadow.descriptor_set_layout,
+		};
+
+		if (vkAllocateDescriptorSets(device, &alloc_info, &shadow.descriptor_set) != VK_SUCCESS) {
+			std::cerr << "Failed to allocate shadow descriptor set\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		// Create pipeline layout
+		VkPipelineLayoutCreateInfo pipeline_layout_info{
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+			.setLayoutCount = 1,
+			.pSetLayouts = &shadow.descriptor_set_layout,
+		};
+
+		if (vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &shadow.pipeline_layout) != VK_SUCCESS) {
+			std::cerr << "Failed to create shadow pipeline layout\n";
+			veekay::app.running = false;
+			return;
+		}
+
+		// Create graphics pipeline
+		VkGraphicsPipelineCreateInfo pipeline_info{
+			.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+			.pNext = &format_info,
+			.stageCount = 1,
+			.pStages = &stage_info,
+			.pVertexInputState = &input_state_info,
+			.pInputAssemblyState = &assembly_state_info,
+			.pViewportState = &shadow_viewport_info,
+			.pRasterizationState = &raster_info,
+			.pMultisampleState = &sample_info,
+			.pDepthStencilState = &depth_info,
+			.pColorBlendState = &blend_info,
+			.pDynamicState = &dyn_state_info,
+			.layout = shadow.pipeline_layout,
+		};
+
+		if (vkCreateGraphicsPipelines(device, nullptr, 1, &pipeline_info, nullptr, &shadow.pipeline) != VK_SUCCESS) {
+			std::cerr << "Failed to create shadow pipeline\n";
+			veekay::app.running = false;
+			return;
+		}
+	}
+
+	// Create shadow sampler
+	{
+		VkSamplerCreateInfo sampler_info{
+			.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+			.magFilter = VK_FILTER_LINEAR,
+			.minFilter = VK_FILTER_LINEAR,
+			.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+			.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+			.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+			.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+			.compareEnable = VK_FALSE,  // Отключено для ручного сравнения глубины
+			.compareOp = VK_COMPARE_OP_ALWAYS,
+			.minLod = 0.0f,
+			.maxLod = VK_LOD_CLAMP_NONE,
+			.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+		};
+
+		if (vkCreateSampler(device, &sampler_info, nullptr, &shadow.sampler) != VK_SUCCESS) {
+			std::cerr << "Failed to create shadow sampler\n";
+			veekay::app.running = false;
+			return;
+		}
+	}
+
+	// Update material descriptor sets with shadow texture now that shadow resources are ready
+	// This MUST be done after shadow.depth_image_view and shadow.sampler are created
+	if (shadow.depth_image_view != VK_NULL_HANDLE && shadow.sampler != VK_NULL_HANDLE) {
+		VkDescriptorImageInfo shadow_image_info{
+			.sampler = shadow.sampler,
+			.imageView = shadow.depth_image_view,
+			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		};
+
+		// Update all material descriptor sets
+		if (!material_descriptor_sets.empty()) {
+			for (size_t i = 0; i < material_descriptor_sets.size(); ++i) {
+				if (material_descriptor_sets[i] != VK_NULL_HANDLE) {
+					VkWriteDescriptorSet write_info{
+						.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+						.dstSet = material_descriptor_sets[i],
+						.dstBinding = 6,
+						.dstArrayElement = 0,
+						.descriptorCount = 1,
+						.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+						.pImageInfo = &shadow_image_info,
+					};
+
+					vkUpdateDescriptorSets(device, 1, &write_info, 0, nullptr);
+				}
+			}
+		}
+
+		// Also update the main descriptor set if it exists
+		if (descriptor_set != VK_NULL_HANDLE) {
+			VkWriteDescriptorSet write_info{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = descriptor_set,
+				.dstBinding = 6,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.pImageInfo = &shadow_image_info,
+			};
+
+			vkUpdateDescriptorSets(device, 1, &write_info, 0, nullptr);
+		}
+	}
+
+	// Create shadow uniform buffer
+	{
+		shadow.uniform_buffer = new veekay::graphics::Buffer(
+			sizeof(veekay::mat4), nullptr,
+			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+		// Update descriptor set with buffers
+		VkDescriptorBufferInfo buffer_infos[] = {
+			{
+				.buffer = shadow.uniform_buffer->buffer,
+				.offset = 0,
+				.range = sizeof(veekay::mat4),
+			},
+			{
+				.buffer = model_uniforms_buffer->buffer,
+				.offset = 0,
+				.range = aligned_model_uniforms_size,
+			},
+		};
+
+		VkWriteDescriptorSet write_infos[] = {
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = shadow.descriptor_set,
+				.dstBinding = 0,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo = &buffer_infos[0],
+			},
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = shadow.descriptor_set,
+				.dstBinding = 1,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+				.pBufferInfo = &buffer_infos[1],
+			},
+		};
+
+		vkUpdateDescriptorSets(device, sizeof(write_infos) / sizeof(write_infos[0]),
+		                       write_infos, 0, nullptr);
+	}
+
+	// Load Dynamic Rendering functions
+	{
+		// Try KHR versions first (for Vulkan 1.2 with extension)
+		vkCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRendering>(
+			vkGetDeviceProcAddr(device, "vkCmdBeginRenderingKHR"));
+		vkCmdEndRenderingKHR = reinterpret_cast<PFN_vkCmdEndRendering>(
+			vkGetDeviceProcAddr(device, "vkCmdEndRenderingKHR"));
+		
+		if (!vkCmdBeginRenderingKHR || !vkCmdEndRenderingKHR) {
+			// Try core versions (Vulkan 1.3+)
+			vkCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRendering>(
+				vkGetDeviceProcAddr(device, "vkCmdBeginRendering"));
+			vkCmdEndRenderingKHR = reinterpret_cast<PFN_vkCmdEndRendering>(
+				vkGetDeviceProcAddr(device, "vkCmdEndRendering"));
+		}
+		
+		if (!vkCmdBeginRenderingKHR || !vkCmdEndRenderingKHR) {
+			std::cerr << "Failed to load Dynamic Rendering functions\n";
+			veekay::app.running = false;
+			return;
+		}
+	}
+
 	// Обновляем позицию камеры на основе вычисленных орбитальных параметров
 	updateCameraPosition();
 
@@ -1818,6 +2474,17 @@ void shutdown() {
 	vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
 	vkDestroyShaderModule(device, fragment_shader_module, nullptr);
 	vkDestroyShaderModule(device, vertex_shader_module, nullptr);
+
+	// Cleanup shadow resources
+	vkDestroyPipeline(device, shadow.pipeline, nullptr);
+	vkDestroyPipelineLayout(device, shadow.pipeline_layout, nullptr);
+	vkDestroyShaderModule(device, shadow.vertex_shader, nullptr);
+	vkDestroyDescriptorSetLayout(device, shadow.descriptor_set_layout, nullptr);
+	delete shadow.uniform_buffer;
+	vkDestroySampler(device, shadow.sampler, nullptr);
+	vkDestroyImageView(device, shadow.depth_image_view, nullptr);
+	vkDestroyImage(device, shadow.depth_image, nullptr);
+	vkFreeMemory(device, shadow.depth_image_memory, nullptr);
 }
 
 void updateCameraPosition() {
@@ -1908,7 +2575,7 @@ void update(double time) {
 	
 	ImGui::Separator();
 	ImGui::Text("Directional Light (Sun)");
-	ImGui::SliderFloat3("Direction", &sun_light_direction.x, -40.0f, 40.0f);
+	ImGui::SliderFloat3("Direction", &sun_light_direction.x, -200.0f, 200.0f);
 	ImGui::ColorEdit3("Sun Color", &sun_light_color.x);
 	
 	// Кнопка для сброса направления к значению по умолчанию
@@ -1939,7 +2606,7 @@ void update(double time) {
 		int boards_x = static_cast<int>(floorf(floor_size_x / board_width));
 		int boards_z = static_cast<int>(floorf(floor_size_z / board_length));
 		int num_floor_boards = boards_x * boards_z;
-		int first_small_torus_index = 2 + num_floor_boards;  // После тора (0), куба (1) и всех досок (2 + num_floor_boards)
+		int first_small_torus_index = 3 + num_floor_boards;  // После тора (0), куба (1) и всех досок (2 + num_floor_boards)
 		
 		// Анимируем все маленькие торы
 		for (int i = first_small_torus_index; i < static_cast<int>(models.size()); ++i) {
@@ -1993,7 +2660,8 @@ void update(double time) {
 	// Камера обновляется каждый кадр
 	updateCameraPosition();
 
-	float aspect_ratio = float(veekay::app.window_width) / float(veekay::app.window_height);
+	const float aspect_ratio = static_cast<float>(veekay::app.window_width) / 
+	                            static_cast<float>(veekay::app.window_height);
 	
 	// Обновление shader-storage буфера с данными точечных источников
 	uint32_t active_light_count = static_cast<uint32_t>(point_lights.size());
@@ -2007,9 +2675,27 @@ void update(double time) {
 		lights_buffer[i] = point_lights[i];
 	}
 	
+	// Compute shadow projection matrix
+	if (shadow.uniform_buffer) {
+		
+		Camera light_camera;
+		veekay::vec3 sun_direction_normalized = veekay::vec3::normalized(sun_light_direction);
+		light_camera.position = -sun_direction_normalized * 15.0f;
+		light_camera.target = {0.0f, 0.0f, 0.0f};
+		
+		shadow.matrix = light_camera.look_at({0, 0, 0}) * orthographic_projection(4.0f, aspect_ratio, 0.0001f, 50.0f);
+
+		// Write to shadow uniform buffer
+		if (shadow.uniform_buffer->mapped_region) {
+			*reinterpret_cast<veekay::mat4*>(shadow.uniform_buffer->mapped_region) = shadow.matrix;
+		}
+	}
+
 	// Добавление времени в uniform
+	veekay::mat4 shadow_proj_matrix = shadow.uniform_buffer ? shadow.matrix : veekay::mat4::identity();
 	SceneUniforms scene_uniforms{
 		.view_projection = camera.view_projection(aspect_ratio),
+		.shadow_projection = shadow_proj_matrix,  // Должна быть сразу после view_projection!
 		.view_position = camera.position,
 		._pad0 = 0.0f,
 		.ambient_light_intensity = ambient_light_intensity,
@@ -2019,7 +2705,10 @@ void update(double time) {
 		.sun_light_color = sun_light_color,
 		._pad3 = 0.0f,
 		.point_light_count = active_light_count,
-		.time = static_cast<float>(time)  // Передача времени для анимации цвета
+		.time = static_cast<float>(time),  // Передача времени для анимации цвета
+		.active_shadow_sources = 1u,  // Включаем тени для направленного света (бит 0)
+		.shadow_bias = 0.004f,
+		._pad4 = 0.0f
 	};
 
 	std::vector<ModelUniforms> model_uniforms(models.size());
@@ -2107,6 +2796,141 @@ void render(VkCommandBuffer cmd, VkFramebuffer framebuffer) {
 		};
 
 		vkBeginCommandBuffer(cmd, &info);
+	}
+
+	// Render shadow map
+	if (vkCmdBeginRenderingKHR && vkCmdEndRenderingKHR && 
+	    shadow.depth_image != VK_NULL_HANDLE && 
+	    shadow.depth_image_view != VK_NULL_HANDLE &&
+	    shadow.pipeline != VK_NULL_HANDLE) {
+		// Debug: проверяем, что shadow pass выполняется
+		static bool first_shadow_pass = true;
+		if (first_shadow_pass) {
+			std::cout << "Shadow pass started\n";
+			first_shadow_pass = false;
+		}
+		// Barrier: transition shadow depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+		VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		VkAccessFlags src_access = 0;
+		
+		if (shadow.current_layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+			src_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+			src_access = VK_ACCESS_SHADER_READ_BIT;
+		}
+		
+		VkImageMemoryBarrier barrier{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcAccessMask = src_access,
+			.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			.oldLayout = shadow.current_layout,
+			.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			.image = shadow.depth_image,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			},
+		};
+
+		vkCmdPipelineBarrier(cmd,
+			src_stage,
+			VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+		// Begin Dynamic Rendering
+		VkRenderingAttachmentInfo depth_attachment{
+			.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+			.imageView = shadow.depth_image_view,
+			.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+			.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+			.clearValue = { .depthStencil = {1.0f, 0} },
+		};
+
+		VkRenderingInfo rendering_info{
+			.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+			.renderArea = {0, 0, shadow_map_size, shadow_map_size},
+			.layerCount = 1,
+			.pDepthAttachment = &depth_attachment,
+		};
+
+		vkCmdBeginRenderingKHR(cmd, &rendering_info);
+
+		// Set viewport and scissor
+		VkViewport viewport{
+			.x = 0.0f, .y = 0.0f,
+			.width = float(shadow_map_size),
+			.height = float(shadow_map_size),
+			.minDepth = 0.0f, .maxDepth = 1.0f,
+		};
+
+		vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+		VkRect2D scissor = {0, 0, shadow_map_size, shadow_map_size};
+		vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+		// Set depth bias
+		vkCmdSetDepthBias(cmd, 2.5f, 0.0f, 3.0f);
+
+		// Bind shadow pipeline
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow.pipeline);
+
+		VkDeviceSize zero_offset = 0;
+		VkBuffer current_vertex_buffer = VK_NULL_HANDLE;
+		VkBuffer current_index_buffer = VK_NULL_HANDLE;
+
+		// Draw all models except skybox
+		for (size_t i = 0, n = models.size(); i < n; ++i) {
+			// Skip skybox faces
+			bool is_skybox_face = false;
+			for (int j = 0; j < 6; ++j) {
+				if (skybox_model_indices[j] != UINT32_MAX && i == skybox_model_indices[j]) {
+					is_skybox_face = true;
+					break;
+				}
+			}
+			if (is_skybox_face) continue;
+
+			const Model& model = models[i];
+			const Mesh& mesh = model.mesh;
+
+			if (!mesh.vertex_buffer || !mesh.index_buffer) continue;
+
+			if (current_vertex_buffer != mesh.vertex_buffer->buffer) {
+				current_vertex_buffer = mesh.vertex_buffer->buffer;
+				vkCmdBindVertexBuffers(cmd, 0, 1, &current_vertex_buffer, &zero_offset);
+			}
+
+			if (current_index_buffer != mesh.index_buffer->buffer) {
+				current_index_buffer = mesh.index_buffer->buffer;
+				vkCmdBindIndexBuffer(cmd, current_index_buffer, zero_offset, VK_INDEX_TYPE_UINT32);
+			}
+
+			uint32_t offset = i * aligned_model_uniforms_size;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			                        shadow.pipeline_layout, 0, 1,
+			                        &shadow.descriptor_set, 1, &offset);
+
+			vkCmdDrawIndexed(cmd, mesh.indices, 1, 0, 0, 0);
+		}
+
+		vkCmdEndRenderingKHR(cmd);
+
+		// Barrier: transition shadow depth image to SHADER_READ_ONLY_OPTIMAL
+		barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+		vkCmdPipelineBarrier(cmd,
+			VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+		// Update layout tracking
+		shadow.current_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	}
 
 	{ // NOTE: Use current swapchain framebuffer and clear it

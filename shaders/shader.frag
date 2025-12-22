@@ -2,11 +2,13 @@
 layout (location = 0) in vec3 f_position;
 layout (location = 1) in vec3 f_normal;
 layout (location = 2) in vec2 f_uv;
+layout (location = 3) in vec4 f_light_space_pos;
 
 layout (location = 0) out vec4 final_color;
 
 layout (binding = 0, std140) uniform SceneUniforms {
   mat4 view_projection;
+  mat4 shadow_projection;  // Матрица проекции теней для направленного света (должна быть сразу после view_projection!)
   vec3 view_position;  // Позиция камеры для расчета view direction
   float _pad0;
   
@@ -21,6 +23,10 @@ layout (binding = 0, std140) uniform SceneUniforms {
   
   uint point_light_count;  // Количество активных точечных источников
   float time;  // Время для анимации цвета
+  
+  uint active_shadow_sources;  // Битовая маска активных источников теней
+  float shadow_bias;  // Смещение для расчета теней
+  float _pad4;
 } scene;
 
 layout (binding = 1, std140) uniform ModelUniforms {
@@ -48,6 +54,25 @@ layout(std430, binding = 2) readonly buffer PointLightsBuffer {
 layout (binding = 3) uniform sampler2D albedo_texture;
 layout (binding = 4) uniform sampler2D specular_texture;
 layout (binding = 5) uniform sampler2D emissive_texture;
+layout (binding = 6) uniform sampler2D shadow_texture;
+
+float calcShadow(vec4 shadow_position, sampler2D shadow_map) {
+  vec3 coords = shadow_position.xyz / shadow_position.w;
+  
+  coords.xy = coords.xy * 0.5 + 0.5;
+  
+  if (coords.z > 1.0 || coords.x < 0.0 || coords.x > 1.0 || 
+      coords.y < 0.0 || coords.y > 1.0) {
+    return 1.0;
+  }
+  
+  float shadow_depth = texture(shadow_map, coords.xy).r;
+  
+  float cur_depth = coords.z;
+  
+  float bias = 0.000005;
+  return (cur_depth - bias) > shadow_depth ? 0.0 : 1.0;
+}
 
 void main() {
   // Нетривиальное сэмплирование: модифицируем UV координаты
@@ -61,8 +86,8 @@ void main() {
     modified_uv.x += sin(f_uv.y * wave_frequency + scene.time * 1.0) * wave_strength;
     modified_uv.y += cos(f_uv.x * wave_frequency + scene.time * 1.0) * wave_strength;
     
-    // Дополнительно: слабое вращение UV координат на основе позиции
-    float angle = length(f_position.xy) * 0.05 + scene.time * 0.2;
+    // Дополнительно: слабое вращение UV координат только на основе времени (не позиции)
+    float angle = scene.time * 0.2;  // Убрана зависимость от позиции
     float cos_a = cos(angle);
     float sin_a = sin(angle);
     vec2 centered_uv = modified_uv - vec2(0.5, 0.5);
@@ -101,12 +126,23 @@ void main() {
   // Рассеянное освещение из uniforms
   vec3 ambient = scene.ambient_light_intensity;
 
+  // Shadow mapping с ручным сравнением глубины
+  float shadow_factor = calcShadow(f_light_space_pos, shadow_texture);
+
   // Направленное освещение (солнце) по модели Блинн-Фонга
-  vec3 half_vector = normalize(view_dir - scene.sun_light_direction);
-  float sun_shade = max(0.0, -dot(scene.sun_light_direction, normal));
-  vec3 sun_diffuse = material_albedo;  // Без умножения на sun_light_color (применяется в итоговой формуле)
+  // sun_light_direction - направление ОТ источника света, поэтому направление К источнику = -sun_light_direction
+
+  vec3 light_dir = -scene.sun_light_direction;  // Направление К источнику света
+  vec3 half_vector = normalize(view_dir + light_dir);  // Half vector для Блинн-Фонга: H = normalize(L + V)
+
+  // Используем dot(normal, light_dir) - если нормаль направлена к свету, то dot > 0
+  // Если нормали инвертированы, инвертируем их здесь
+
+  float sun_shade = max(0.0, dot(normal, light_dir));  // Используем dot(normal, light_dir) для правильного освещения
+
+  vec3 sun_diffuse = material_albedo;
   vec3 sun_specular = material_specular * pow(max(0.0, dot(normal, half_vector)), material_shininess);
-  vec3 sun_light_intensity = sun_shade * scene.sun_light_color * (sun_diffuse + sun_specular);
+  vec3 sun_light_intensity = sun_shade * scene.sun_light_color * (sun_diffuse + sun_specular) * shadow_factor;
 
   // Итоговый цвет
   vec3 result = ambient + sun_light_intensity;
@@ -116,15 +152,14 @@ void main() {
     for (uint i = 0; i < scene.point_light_count && i < lights.length(); ++i) {
       PointLight light = lights[i];
       
-      // Направление к источнику света
-      vec3 light_dir = light.position - f_position;
-      float distance = length(light_dir);
-      light_dir = normalize(light_dir);
+      // Направление к источнику света (от поверхности к источнику)
+      vec3 light_dir = normalize(light.position - f_position);
+      float distance = length(light.position - f_position);
       
       // Закон обратных квадратов (attenuation)
       float attenuation = light.intensity / (distance * distance + 0.01);
-      
-      // Diffuse компонент
+
+      // Diffuse компонент (normal и light_dir должны быть в одном направлении)
       float diff = max(dot(normal, light_dir), 0.0);
       vec3 diffuse = diff * material_albedo * light.color;
       

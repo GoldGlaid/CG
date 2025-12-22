@@ -3,7 +3,7 @@ include(FetchContent)
 
 project(testbed LANGUAGES C CXX)
 
-add_executable(${PROJECT_NAME} lab3.cpp)
+add_executable(${PROJECT_NAME} lab4.cpp)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD_REQUIRED TRUE CXX_STANDARD 20)
 
@@ -51,6 +51,7 @@ if(GLSLC_FOUND)
 
 	compile_shader(shader.vert)
 	compile_shader(shader.frag)
+	compile_shader(shadow.vert)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)

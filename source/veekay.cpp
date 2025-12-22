@@ -59,6 +59,7 @@ std::vector<VkFramebuffer> vk_framebuffers;
 std::vector<VkSemaphore> vk_render_semaphores;
 std::vector<VkSemaphore> vk_present_semaphores;
 std::vector<VkFence> vk_in_flight_fences;
+std::vector<VkFence> vk_images_in_flight;  // Per-image fences for proper synchronization
 uint32_t vk_current_frame;
 
 VkCommandPool vk_command_pool;
@@ -150,8 +151,15 @@ int veekay::run(const veekay::ApplicationInfo& app_info) {
 			.samplerAnisotropy = true,
 		};
 
+		// Enable dynamic rendering feature
+		VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_features{
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+			.dynamicRendering = VK_TRUE,
+		};
+
 		auto selector_result = physical_device_selector.set_surface(vk_surface)
 		                                               .set_required_features(device_features)
+		                                               .add_required_extension_features(dynamic_rendering_features)
 		                                               .select();
 		if (!selector_result) {
 			std::cerr << selector_result.error().message() << '\n';
@@ -159,6 +167,9 @@ int veekay::run(const veekay::ApplicationInfo& app_info) {
 		}
 
 		auto physical_device = selector_result.value();
+
+		// Enable Dynamic Rendering extension if available (optional extension)
+		physical_device.enable_extension_if_present("VK_KHR_dynamic_rendering");
 
 		{
 			vkb::DeviceBuilder device_builder(physical_device);
@@ -586,6 +597,7 @@ int veekay::run(const veekay::ApplicationInfo& app_info) {
 
 		vk_render_semaphores.resize(max_frames_in_flight);
 		vk_in_flight_fences.resize(max_frames_in_flight);
+		vk_images_in_flight.resize(vk_swapchain_images.size(), VK_NULL_HANDLE);
 
 		for (uint32_t i = 0; i < max_frames_in_flight; ++i) {
 			vkCreateSemaphore(vk_device, &sem_info, nullptr, &vk_render_semaphores[i]);
@@ -685,6 +697,16 @@ int veekay::run(const veekay::ApplicationInfo& app_info) {
 		vkAcquireNextImageKHR(vk_device, vk_swapchain, UINT64_MAX,
 		                      vk_render_semaphores[vk_current_frame],
 		                      nullptr, &swapchain_image_index);
+
+		// Wait for the specific image's fence to ensure the command buffer is not in use
+		// This prevents reusing a command buffer that's still being executed
+		// Only wait if it's a different fence than the one we just waited for
+		if (vk_images_in_flight[swapchain_image_index] != VK_NULL_HANDLE && 
+		    vk_images_in_flight[swapchain_image_index] != vk_in_flight_fences[vk_current_frame]) {
+			vkWaitForFences(vk_device, 1, &vk_images_in_flight[swapchain_image_index], true, UINT64_MAX);
+		}
+		// Mark this image as being used by the current frame's fence
+		vk_images_in_flight[swapchain_image_index] = vk_in_flight_fences[vk_current_frame];
 
 		VkCommandBuffer cmd = vk_command_buffers[swapchain_image_index];
 
